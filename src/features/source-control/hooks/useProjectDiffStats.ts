@@ -1,5 +1,6 @@
 import { useCallback, useSyncExternalStore } from "react";
 import { gitDiffStats, subscribeGitChanged, type GitDiffStats } from "../../../platform/tauri/fs";
+import { hiddenRepos } from "../model/hiddenRepos";
 
 type Entry = {
   cwd: string;
@@ -57,7 +58,7 @@ async function load(entry: Entry, force = false) {
   entry.inFlight = true;
   const epoch = entry.epoch;
   try {
-    const stats = await gitDiffStats(entry.cwd);
+    const stats = await gitDiffStats(entry.cwd, hiddenRepos(entry.cwd));
     if (epoch === entry.epoch) {
       entry.loadedAt = Date.now();
       publish(entry, stats);
@@ -83,6 +84,12 @@ export function applyProjectDiffStats(cwd: string, stats: GitDiffStats) {
   entry.epoch += 1;
   entry.loadedAt = Date.now();
   publish(entry, stats);
+}
+
+/** Re-reads stats for `cwd` when something is showing them. */
+export function refreshProjectDiffStats(cwd: string) {
+  const entry = entries.get(cwd);
+  if (entry?.listeners.size) void load(entry, true);
 }
 
 function start(entry: Entry) {

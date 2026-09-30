@@ -307,6 +307,7 @@ pub fn run() {
             fs::git_diff_stats,
             fs::git_diff_index,
             fs::git_diff_files,
+            fs::git_nested_repos,
             fs::git_file_diff,
             fs::git_history,
             fs::git_commit_files,

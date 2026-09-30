@@ -1,11 +1,14 @@
 import { useCallback, useSyncExternalStore } from "react";
 import {
+  gitDiffFiles,
   gitDiffIndex,
   subscribeGitChanged,
   type GitDiffIndex,
 } from "../../../platform/tauri/fs";
 import { subscribeDirsChanged } from "../../files/model/fileTree";
 import { parentPath } from "../../../shared/lib/paths";
+import { hiddenRepos } from "../model/hiddenRepos";
+import { knownNestedRepos } from "./useNestedRepos";
 
 export type GitStatusMap = {
   files: Map<string, string>;
@@ -102,8 +105,18 @@ async function load(entry: Entry, force = false) {
   if (!force && document.hidden) return;
   entry.inFlight = true;
   try {
-    const index = await gitDiffIndex(entry.cwd);
-    publish(entry, buildStatusMaps(index, entry.cwd));
+    const hidden = hiddenRepos(entry.cwd);
+    const nested = (await knownNestedRepos(entry.cwd)).filter(
+      (repo) => repo.relative && !hidden.includes(repo.relative),
+    );
+    const [index, ...others] = await Promise.all([
+      gitDiffIndex(entry.cwd),
+      ...nested.map((repo) => gitDiffFiles(repo.path).catch(() => null)),
+    ]);
+    const files = index.files.concat(
+      ...others.map((other) => other?.files ?? []),
+    );
+    publish(entry, buildStatusMaps({ ...index, files }, entry.cwd));
   } catch {
     publish(entry, EMPTY);
   } finally {

@@ -77,6 +77,7 @@ import {
 import { invalidateWatchedFiles } from "../../files/model/fileWatch";
 import { MOD } from "../../../platform/tauri/platform";
 import { applyProjectDiffStats } from "../hooks/useProjectDiffStats";
+import { cachedNestedRepos } from "../hooks/useNestedRepos";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import { isRemoteProjectPath } from "../../projects/model/recents";
 
@@ -108,6 +109,8 @@ type Props = {
   selectedPath?: string;
   selectedKind?: GitFileDiffKind;
   selectedSha?: string;
+  /** Shown under the header when the project folder holds several checkouts. */
+  repositories?: ReactNode;
   onOpenFile: (path: string, kind: GitFileDiffKind, pin?: boolean) => void;
   onOpenAllChanges: () => void;
   onOpenCommit: (commit: GitHistoryCommit, pin?: boolean) => void;
@@ -120,6 +123,7 @@ export function GitChangesPanel({
   selectedPath,
   selectedKind,
   selectedSha,
+  repositories,
   onOpenFile,
   onOpenAllChanges,
   onOpenCommit,
@@ -270,6 +274,7 @@ export function GitChangesPanel({
           <span className="ml-auto" />
         )}
       </header>
+      {repositories}
       <ChangedFiles
         cwd={cwd}
         textHarness={textHarness}
@@ -1607,11 +1612,15 @@ function useDiffIndex(
         indexByCwd.set(cwd, next);
         indexRef.current = next;
         setIndex(next);
-        applyProjectDiffStats(cwd, {
-          files: next.files.length,
-          additions: next.additions,
-          deletions: next.deletions,
-        });
+        // A folder holding other checkouts reports theirs too; its own index
+        // alone would undercount the badge.
+        if (!cachedNestedRepos(cwd).some((repo) => repo.relative)) {
+          applyProjectDiffStats(cwd, {
+            files: next.files.length,
+            additions: next.additions,
+            deletions: next.deletions,
+          });
+        }
         if (prev) {
           const paths = changedFilePaths(prev, next);
           invalidateWatchedFiles(paths);

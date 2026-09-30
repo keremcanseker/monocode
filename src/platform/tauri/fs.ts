@@ -178,8 +178,12 @@ export type GitDiffStats = {
   deletions: number;
 };
 
-export function gitDiffStats(cwd: string): Promise<GitDiffStats> {
-  return invoke<GitDiffStats>("git_diff_stats", { cwd });
+/** Summed across checkouts below `cwd`, except the `hidden` ones (relative paths). */
+export function gitDiffStats(
+  cwd: string,
+  hidden: string[] = [],
+): Promise<GitDiffStats> {
+  return invoke<GitDiffStats>("git_diff_stats", { cwd, hidden });
 }
 
 export type GitChangedFile = {
@@ -214,6 +218,27 @@ export function gitDiffIndex(cwd: string): Promise<GitDiffIndex> {
 /** File list and counts only, for diff content views that do not need sync data. */
 export function gitDiffFiles(cwd: string): Promise<GitDiffIndex> {
   return invoke<GitDiffIndex>("git_diff_files", { cwd });
+}
+
+export type GitNestedRepo = {
+  /** Relative to the opened folder; "" is the folder itself. */
+  relative: string;
+  branch: string | null;
+  files: number;
+  upstream: boolean;
+  ahead: number;
+  behind: number;
+};
+
+/**
+ * Checkouts at or below `cwd`, the folder itself first when it is one.
+ * `hidden` ones come back by path only, without their git state.
+ */
+export function gitNestedRepos(
+  cwd: string,
+  hidden: string[] = [],
+): Promise<GitNestedRepo[]> {
+  return invoke<GitNestedRepo[]>("git_nested_repos", { cwd, hidden });
 }
 
 export type GitFileDiff = {

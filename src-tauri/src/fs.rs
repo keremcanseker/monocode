@@ -838,10 +838,15 @@ pub struct GitDiffStats {
 /// Uncommitted line counts for the opened folder: staged + unstaged vs HEAD,
 /// plus untracked (gitignore-aware) files counted as additions.
 #[tauri::command]
-pub async fn git_diff_stats(cwd: String) -> Result<GitDiffStats, String> {
-    tauri::async_runtime::spawn_blocking(move || git_diff_stats_for(&expand_home(&cwd)))
-        .await
-        .map_err(|e| e.to_string())
+pub async fn git_diff_stats(
+    cwd: String,
+    hidden: Option<Vec<String>>,
+) -> Result<GitDiffStats, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_diff_stats_for(&expand_home(&cwd), &hidden.unwrap_or_default())
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -887,6 +892,65 @@ pub async fn git_diff_files(cwd: String) -> Result<GitDiffIndex, String> {
     tauri::async_runtime::spawn_blocking(move || git_diff_files_for(&expand_home(&cwd)))
         .await
         .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GitNestedRepo {
+    /// Relative to the opened folder; "" is the folder itself.
+    pub relative: String,
+    pub branch: Option<String>,
+    pub files: i64,
+    pub upstream: bool,
+    pub ahead: i64,
+    pub behind: i64,
+}
+
+/// Checkouts at or below the opened folder with their branch, changed-file
+/// count and upstream sync, so the Changes pane can switch between repos kept
+/// side by side. `hidden` ones are listed by path only, without running git.
+#[tauri::command]
+pub async fn git_nested_repos(
+    cwd: String,
+    hidden: Option<Vec<String>>,
+) -> Result<Vec<GitNestedRepo>, String> {
+    let hidden = hidden.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = expand_home(&cwd);
+        git_nested_repos_for(&root)
+            .into_iter()
+            .map(|relative| {
+                if hidden.contains(&relative) {
+                    return GitNestedRepo {
+                        relative,
+                        branch: None,
+                        files: 0,
+                        upstream: false,
+                        ahead: 0,
+                        behind: 0,
+                    };
+                }
+                let path = root.join(&relative);
+                let upstream =
+                    git_stdout(&path, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_some();
+                let (ahead, behind) = if upstream {
+                    git_ahead_behind(&path, "@{upstream}")
+                } else {
+                    (0, 0)
+                };
+                GitNestedRepo {
+                    branch: git_branch(&path),
+                    files: git_repo_diff_stats(&path).files,
+                    upstream,
+                    ahead,
+                    behind,
+                    relative,
+                }
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -1743,7 +1807,23 @@ pub async fn git_stash(cwd: String, message: Option<String>) -> Result<(), Strin
     .map_err(|e| e.to_string())?
 }
 
-fn git_diff_stats_for(root: &Path) -> GitDiffStats {
+/// Sums every checkout at or below the folder, so a folder that only holds
+/// repos still reports the changes kept in them. `hidden` ones are left out.
+fn git_diff_stats_for(root: &Path, hidden: &[String]) -> GitDiffStats {
+    let mut total = GitDiffStats::default();
+    for relative in git_nested_repos_for(root) {
+        if hidden.contains(&relative) {
+            continue;
+        }
+        let stats = git_repo_diff_stats(&root.join(relative));
+        total.files += stats.files;
+        total.additions += stats.additions;
+        total.deletions += stats.deletions;
+    }
+    total
+}
+
+fn git_repo_diff_stats(root: &Path) -> GitDiffStats {
     if !git_is_work_tree(root) {
         return GitDiffStats::default();
     }
@@ -1776,6 +1856,47 @@ fn git_diff_stats_for(root: &Path) -> GitDiffStats {
         additions,
         deletions,
     }
+}
+
+/// How many folders below the project a nested checkout may sit.
+const NESTED_REPO_DEPTH: usize = 3;
+
+fn git_nested_repos_for(root: &Path) -> Vec<String> {
+    let mut repos = Vec::new();
+    if git_is_work_tree(root) {
+        repos.push(String::new());
+    }
+    let mut pending = vec![(root.to_path_buf(), 1)];
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // file_type() does not follow symlinks, so linked folders cannot loop.
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') || skip_walk_dir_name(name) {
+                continue;
+            }
+            let path = entry.path();
+            // Found checkouts are not scanned further, so their submodules and
+            // vendored repos stay out of the list.
+            if path.join(".git").exists() {
+                if let Ok(relative) = path.strip_prefix(root) {
+                    repos.push(path_to_js(relative));
+                }
+            } else if depth < NESTED_REPO_DEPTH {
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    repos.sort();
+    repos
 }
 
 #[derive(Clone, Default)]
@@ -6602,7 +6723,7 @@ mod tests {
         let dir = tmp("git-diff-none");
         std::fs::write(dir.0.join("notes.txt"), "hello\n").unwrap();
         assert_eq!(
-            git_diff_stats_for(&dir.0),
+            git_diff_stats_for(&dir.0, &[]),
             GitDiffStats {
                 files: 0,
                 additions: 0,
@@ -6622,7 +6743,7 @@ mod tests {
         std::fs::write(dir.0.join("ignored.txt"), "nope\n").unwrap();
         std::fs::write(dir.0.join(".gitignore"), "ignored.txt\n").unwrap();
 
-        let stats = git_diff_stats_for(&dir.0);
+        let stats = git_diff_stats_for(&dir.0, &[]);
         // a.txt: -beta +delta; new.txt: +2; .gitignore: +1 untracked
         assert_eq!(stats.files, 3);
         assert_eq!(stats.additions, 4);
@@ -6636,13 +6757,39 @@ mod tests {
             return;
         }
         assert_eq!(
-            git_diff_stats_for(&dir.0),
+            git_diff_stats_for(&dir.0, &[]),
             GitDiffStats {
                 files: 0,
                 additions: 0,
                 deletions: 0
             }
         );
+    }
+
+    #[test]
+    fn git_nested_repos_lists_checkouts_below_the_folder() {
+        let dir = tmp("git-nested-repos");
+        for repo in ["api", "apps/web"] {
+            let path = dir.0.join(repo);
+            std::fs::create_dir_all(&path).unwrap();
+            if !init_git(&path, "main", None) {
+                return;
+            }
+        }
+        std::fs::create_dir_all(dir.0.join("apps/web/packages/inner/.git")).unwrap();
+        std::fs::create_dir_all(dir.0.join("node_modules/pkg/.git")).unwrap();
+        std::fs::create_dir_all(dir.0.join("a/b/c/deep/.git")).unwrap();
+        assert_eq!(git_nested_repos_for(&dir.0), vec!["api", "apps/web"]);
+
+        std::fs::write(dir.0.join("api/new.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.0.join("apps/web/new.txt"), "one\n").unwrap();
+        let stats = git_diff_stats_for(&dir.0, &[]);
+        assert_eq!((stats.files, stats.additions), (2, 3));
+        let stats = git_diff_stats_for(&dir.0, &["api".to_string()]);
+        assert_eq!((stats.files, stats.additions), (1, 1));
+
+        assert!(init_git(&dir.0, "main", None));
+        assert_eq!(git_nested_repos_for(&dir.0), vec!["", "api", "apps/web"]);
     }
 
     #[test]

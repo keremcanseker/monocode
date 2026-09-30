@@ -268,9 +268,18 @@ type Props = {
   canGoForward?: boolean;
   onGoBack?: () => void;
   onGoForward?: () => void;
-  onOpenDiff?: (path: string, kind?: GitFileDiffKind, pin?: boolean) => void;
-  onOpenAllChanges?: () => void;
-  onOpenCommit?: (commit: GitHistoryCommit, pin?: boolean) => void;
+  onOpenDiff?: (
+    path: string,
+    kind?: GitFileDiffKind,
+    pin?: boolean,
+    repoCwd?: string,
+  ) => void;
+  onOpenAllChanges?: (repoCwd?: string) => void;
+  onOpenCommit?: (
+    commit: GitHistoryCommit,
+    pin?: boolean,
+    repoCwd?: string,
+  ) => void;
   selectedDiffPath?: string;
   selectedDiffKind?: GitFileDiffKind;
   selectedCommitSha?: string;
@@ -2000,6 +2009,7 @@ function SidebarComponent({
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
             <SourceControl
                 cwd={gitRoot}
+                projectCwd={cwd}
                 enabled={panelOpen}
                 textHarness={textHarness}
                 selectedPath={selectedDiffPath}
@@ -2011,6 +2021,7 @@ function SidebarComponent({
                 }
                 onOpenAllChanges={onOpenAllChanges ?? (() => {})}
                 onOpenCommit={onOpenCommit ?? (() => {})}
+                onOpenTerminal={remoteProject ? undefined : onOpenTerminal}
               />
           </div>
         ) : null}

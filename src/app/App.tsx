@@ -1493,8 +1493,19 @@ export default function App({
     sidebarCwdKey != null &&
     !loadedProjects.has(sidebarCwdKey) &&
     !historyFailed;
+  // A diff from a checkout nested in the project keeps that checkout as its own
+  // cwd, but the explorer, terminals and Changes pane stay on the project.
+  const tabCwd =
+    activeFile?.cwd &&
+    !(
+      sidebarCwd &&
+      !sameProjectPath(activeFile.cwd, sidebarCwd) &&
+      isEqualOrInside(activeFile.cwd, sidebarCwd)
+    )
+      ? activeFile.cwd
+      : undefined;
   const gitCwd =
-    activeFile?.cwd ?? (active ? sessionWorkCwd(active) : sidebarCwd);
+    tabCwd ?? (active ? sessionWorkCwd(active) : sidebarCwd);
   const gitCwdBranches = useProjectBranches(
     gitCwd,
     Boolean(gitCwd) && gitCwd !== "~" && !isRemoteProjectPath(sidebarCwd),
@@ -3490,9 +3501,10 @@ export default function App({
       session?: { sessionId: string; cwd: string },
       changeKind?: GitFileDiffKind,
       pin = false,
+      repoCwd?: string,
     ) => {
       void (async () => {
-        const diffCwd = session?.cwd ?? gitCwdRef.current;
+        const diffCwd = session?.cwd ?? repoCwd ?? gitCwdRef.current;
         const diffProjectCwd = session
           ? sessionsRef.current.find((entry) => entry.id === session.sessionId)
               ?.cwd
@@ -3539,19 +3551,19 @@ export default function App({
   );
 
   const onOpenWorkingTreeDiff = useCallback(
-    (path: string, kind?: GitFileDiffKind, pin?: boolean) =>
-      onOpenDiff(path, undefined, kind, pin),
+    (path: string, kind?: GitFileDiffKind, pin?: boolean, repoCwd?: string) =>
+      onOpenDiff(path, undefined, kind, pin, repoCwd),
     [onOpenDiff],
   );
 
   /** Stack every working-tree change in one review, whatever the diff-view setting. */
-  const onOpenAllChanges = useCallback(() => {
+  const onOpenAllChanges = useCallback((repoCwd?: string) => {
     setTabs((prev) =>
       prev.map((tab) =>
         tab.id === activeTabId
           ? openChangesTab(
               tab,
-              gitCwdRef.current,
+              repoCwd ?? gitCwdRef.current,
               undefined,
               undefined,
               sidebarCwdRef.current,
@@ -3563,13 +3575,13 @@ export default function App({
   }, [activeTabId]);
 
   const onOpenCommit = useCallback(
-    (commit: GitHistoryCommit, pin?: boolean) => {
+    (commit: GitHistoryCommit, pin?: boolean, repoCwd?: string) => {
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
             ? openCommitTab(
                 tab,
-                gitCwdRef.current,
+                repoCwd ?? gitCwdRef.current,
                 {
                   sha: commit.sha,
                   shortSha: commit.shortSha,
