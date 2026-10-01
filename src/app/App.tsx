@@ -298,6 +298,7 @@ import {
   beginSessionTurn,
   applySessionCheckpoint,
   captureSessionCheckpoint,
+  ensureSessionCheckpoint,
   forgetSessionCheckpoint,
   flushSessionCheckpoint,
   keepSessionChanges,
@@ -6668,7 +6669,9 @@ export default function App({
             revealHandoff(wrap.text);
           }
           nudgeOpenEditors(event, workCwd);
-          if (!orchestrator.forSession(sessionId))
+          // Isolated workers record edits for integration; the lead and
+          // shared-checkout workers do not own a review of their own.
+          if (!orchestrator.forSession(sessionId) || isolatedWorker(sessionId))
             trackSessionEdits(sessionId, workCwd, event);
           const routed = routePlanEvent(event);
           if (routed) enqueueHarnessEvent(sessionId, routed);
@@ -8679,6 +8682,10 @@ export default function App({
                   ),
                 );
         const checkoutCwd = workspace.checkoutCwd;
+        // Integration replays the worker's captured edits onto the lead
+        // checkout, so its baseline must be the seeded copy before any turn.
+        if (task.workspacePolicy !== "shared")
+          await ensureSessionCheckpoint(task.sessionId, checkoutCwd);
         const scratchDir = await invoke<string>("control_attach_worker", {
           leadId: run.leadId,
           sessionId: task.sessionId,
@@ -11249,6 +11256,13 @@ function dropOpenFiles(
     });
   }
   return { ...tab, layout, focusedId, editorPanes };
+}
+
+function isolatedWorker(sessionId: string): boolean {
+  const run = orchestrator.forSession(sessionId);
+  if (!run || run.leadId === sessionId) return false;
+  const task = run.tasks.find((entry) => entry.sessionId === sessionId);
+  return task?.workspacePolicy !== "shared";
 }
 
 function trackSessionEdits(
