@@ -4,7 +4,10 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::fs::{expand_home, git_checked, git_diff_files_for, path_to_js, resolve_repo_path};
+use crate::fs::{
+    composite_head, expand_home, git_checked, git_diff_files_for, git_is_work_tree,
+    git_nested_repos_for, path_to_js, resolve_repo_path,
+};
 use crate::session_store::SessionStore;
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -71,10 +74,76 @@ fn parse_worktrees(text: &str) -> Vec<Worktree> {
 }
 
 fn list(root: &Path) -> Result<Vec<Worktree>, String> {
+    if !git_is_work_tree(root) {
+        return composite_list(root);
+    }
     Ok(parse_worktrees(&git(
         root,
         &["worktree", "list", "--porcelain", "-z"],
     )?))
+}
+
+/// A folder that is not a repo but holds several stands in as the main working
+/// copy, and each `<folder>-worktrees/<slug>` mirroring its checkouts is an
+/// isolated copy. Orchestration then treats the folder like one repository.
+fn composite_list(root: &Path) -> Result<Vec<Worktree>, String> {
+    let nested = git_nested_repos_for(root);
+    if nested.is_empty() {
+        return Err(format!("{} is not a git repository", root.display()));
+    }
+    let mut trees = vec![Worktree {
+        path: path_to_js(root),
+        head: String::from_utf8_lossy(&composite_head(root)?).trim().to_owned(),
+        is_main: true,
+        ..Default::default()
+    }];
+    let Ok(entries) = std::fs::read_dir(default_root(root)) else {
+        return Ok(trees);
+    };
+    let mut copies: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| nested.iter().all(|rel| path.join(rel).join(".git").exists()))
+        .collect();
+    copies.sort();
+    for path in copies {
+        trees.push(Worktree {
+            path: path_to_js(&path),
+            branch: git(&path.join(&nested[0]), &["symbolic-ref", "--short", "HEAD"])
+                .ok()
+                .map(|branch| branch.trim().to_owned()),
+            head: composite_head(&path)
+                .map(|head| String::from_utf8_lossy(&head).trim().to_owned())
+                .unwrap_or_default(),
+            ..Default::default()
+        });
+    }
+    Ok(trees)
+}
+
+/// The checkouts a copy of `root` consists of: the copy itself, or one per
+/// nested repo when `root` is a folder of repos.
+fn members(root: &Path, path: &Path) -> Vec<PathBuf> {
+    if git_is_work_tree(root) {
+        return vec![path.to_path_buf()];
+    }
+    git_nested_repos_for(root)
+        .into_iter()
+        .map(|rel| path.join(rel))
+        .collect()
+}
+
+fn slug(branch: &str) -> String {
+    branch
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -155,31 +224,35 @@ pub fn git_worktrees(cwd: String, store: State<'_, SessionStore>) -> Result<Work
 }
 
 fn create(root: &Path, branch: &str, base: &str, existing: bool) -> Result<Worktree, String> {
+    let main = list(root)?
+        .into_iter()
+        .next()
+        .ok_or("No working copies found")?;
+    let path = default_root(Path::new(&main.path)).join(slug(branch.trim()));
+    create_at(root, branch, base, existing, &path)
+}
+
+/// `create` at a caller-chosen path; a composite copy places each nested
+/// checkout at its own relative path.
+fn create_at(
+    root: &Path,
+    branch: &str,
+    base: &str,
+    existing: bool,
+    path: &Path,
+) -> Result<Worktree, String> {
     let branch = branch.trim();
     if branch.starts_with('-') || branch.starts_with('@') || branch.is_empty() {
         return Err("Enter a valid branch name".into());
     }
     git(root, &["check-ref-format", "--branch", branch])?;
-    let trees = list(root)?;
-    if trees
+    if list(root)?
         .iter()
         .any(|tree| tree.branch.as_deref() == Some(branch))
     {
         return Err("This branch already has a working copy. Select it from the picker.".into());
     }
-    let main = trees.first().ok_or("No working copies found")?;
-    let parent = default_root(Path::new(&main.path));
-    let slug: String = branch
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let path = parent.join(slug);
+    let parent = path.parent().ok_or("Invalid worktree path")?;
     if path.exists() {
         return Err(format!(
             "{} already exists. Choose another branch name.",
@@ -351,10 +424,65 @@ fn checkout_state_matches(source: &Path, target: &Path) -> bool {
 }
 
 fn create_seeded(root: &Path, branch: &str) -> Result<Worktree, String> {
+    if git_is_work_tree(root) {
+        return create_seeded_at(root, branch, None);
+    }
+    create_composite(root, branch)
+}
+
+/// Mirror a folder of checkouts: one seeded worktree per nested repo, at the
+/// same relative path under `<folder>-worktrees/<slug>`, so project-relative
+/// paths mean the same thing in the copy as in the folder. Files kept in the
+/// folder outside any repo are not copied.
+fn create_composite(root: &Path, branch: &str) -> Result<Worktree, String> {
+    let nested = git_nested_repos_for(root);
+    if nested.is_empty() {
+        return Err(format!(
+            "{} is not a git repository and holds none to isolate",
+            root.display()
+        ));
+    }
+    let path = default_root(root).join(slug(branch));
+    let mut created: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+    for relative in &nested {
+        let repo = root.join(relative);
+        let member = path.join(relative);
+        let branch_was_new =
+            git(&repo, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]).is_err();
+        if let Err(error) = create_seeded_at(&repo, branch, Some(&member)) {
+            for (repo, member, was_new) in created {
+                let _ = remove(&repo, &member, true);
+                if was_new {
+                    let _ = git(&repo, &["branch", "-D", branch]);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(format!("{relative}: {error}"));
+        }
+        created.push((repo, member, branch_was_new));
+    }
+    Ok(Worktree {
+        path: path_to_js(&path),
+        branch: Some(branch.to_owned()),
+        head: String::from_utf8_lossy(&composite_head(&path)?).trim().to_owned(),
+        ..Default::default()
+    })
+}
+
+fn create_seeded_at(root: &Path, branch: &str, at: Option<&Path>) -> Result<Worktree, String> {
     if let Some(tree) = list(root)?
         .into_iter()
         .find(|tree| tree.branch.as_deref() == Some(branch))
     {
+        if let Some(at) = at {
+            if !same_path(Path::new(&tree.path), at) {
+                return Err(format!(
+                    "The recovered orchestration worktree for {branch} is at {} instead of {}. It was kept for manual review.",
+                    tree.path,
+                    at.display()
+                ));
+            }
+        }
         let source_head = git(root, &["rev-parse", "HEAD"])?;
         if tree.head != source_head.trim() || !checkout_state_matches(root, Path::new(&tree.path)) {
             return Err(format!(
@@ -374,7 +502,10 @@ fn create_seeded(root: &Path, branch: &str) -> Result<Worktree, String> {
             ));
         }
     }
-    let tree = create(root, branch, "HEAD", branch_exists)?;
+    let tree = match at {
+        Some(path) => create_at(root, branch, "HEAD", branch_exists, path)?,
+        None => create(root, branch, "HEAD", branch_exists)?,
+    };
     if let Err(error) = copy_checkout_state(root, Path::new(&tree.path)) {
         let _ = remove(root, Path::new(&tree.path), true);
         if !branch_exists {
@@ -479,20 +610,37 @@ fn check_removal(root: &Path, path: &Path, force: bool, has_terminals: bool) -> 
     }
     // Sessions and their agents still exist during preflight. The actual
     // removal below checks them again after the session deletion lifecycle.
-    if !force
-        && !git(
-            Path::new(&tree.path),
-            &["status", "--porcelain", "--untracked-files=normal"],
-        )?
-        .is_empty()
-    {
-        return Err("This worktree has uncommitted or untracked changes.".into());
+    if !force {
+        for member in members(root, Path::new(&tree.path)) {
+            if !git(
+                &member,
+                &["status", "--porcelain", "--untracked-files=normal"],
+            )?
+            .is_empty()
+            {
+                return Err("This worktree has uncommitted or untracked changes.".into());
+            }
+        }
     }
     Ok(())
 }
 
 fn remove(root: &Path, path: &Path, force: bool) -> Result<(), String> {
     let tree = removal_target(root, path)?;
+    if !git_is_work_tree(root) {
+        let copy = Path::new(&tree.path);
+        for relative in git_nested_repos_for(root) {
+            let member = copy.join(&relative);
+            if member.exists() {
+                remove(&root.join(&relative), &member, force)?;
+            }
+        }
+        // Only the mirror's own folders remain once its worktrees are gone.
+        return match std::fs::remove_dir_all(copy) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(()),
+        };
+    }
     let mut args = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -645,16 +793,44 @@ pub(crate) fn reconcile_removals(conn: &rusqlite::Connection) -> Result<(), Stri
     for (path, json) in pending {
         // A surviving Git link means removal did not finish. If the link/folder
         // is gone, the already-persisted detached sessions are the final state.
-        let restore = if Path::new(&path)
-            .join(".git")
-            .try_exists()
-            .map_err(|e| e.to_string())?
-        {
+        let restore = if checkout_lingers(Path::new(&path)) {
             serde_json::from_str::<Vec<SessionBeforeRemoval>>(&json).map_err(|e| e.to_string())?
         } else {
             Vec::new()
         };
         finish_removal(conn, &path, &restore)?;
+    }
+    Ok(())
+}
+
+/// A worktree folder, or a composite copy whose nested worktrees survived.
+fn checkout_lingers(path: &Path) -> bool {
+    path.join(".git").exists()
+        || std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.path().join(".git").exists())
+            })
+            .unwrap_or(false)
+}
+
+/// Delete a run's temporary branch from every checkout the folder stands for,
+/// leaving any branch that still has a worktree.
+fn delete_orchestration_branch(root: &Path, branch: &str) -> Result<(), String> {
+    for repo in members(root, root) {
+        git(&repo, &["check-ref-format", "--branch", branch])?;
+        let branch_ref = format!("refs/heads/{branch}");
+        if git(&repo, &["rev-parse", "--verify", &branch_ref]).is_err() {
+            continue;
+        }
+        if list(&repo)?
+            .iter()
+            .any(|tree| tree.branch.as_deref() == Some(branch))
+        {
+            return Err("The orchestration branch still has a worktree".into());
+        }
+        git(&repo, &["branch", "-D", branch])?;
     }
     Ok(())
 }
@@ -740,7 +916,9 @@ pub fn git_orchestration_worktree_remove(
     let removed = remove_with_sessions(&conn, &root, &path, true, true)?;
     if let Some(branch) = branch {
         if branch.starts_with("mc/orch-") {
-            if let Err(error) = git(Path::new(&removed.project_cwd), &["branch", "-D", &branch]) {
+            if let Err(error) =
+                delete_orchestration_branch(Path::new(&removed.project_cwd), &branch)
+            {
                 eprintln!("Orchestration worktree removed; temporary branch cleanup will need a retry: {error}");
             }
         }
@@ -756,18 +934,7 @@ pub async fn git_orchestration_branch_remove(cwd: String, branch: String) -> Res
         if !branch.starts_with("mc/orch-") {
             return Err("Only orchestration temporary branches can be removed here".into());
         }
-        git(&root, &["check-ref-format", "--branch", branch])?;
-        let branch_ref = format!("refs/heads/{branch}");
-        if git(&root, &["rev-parse", "--verify", &branch_ref]).is_err() {
-            return Ok(());
-        }
-        if list(&root)?
-            .iter()
-            .any(|tree| tree.branch.as_deref() == Some(branch))
-        {
-            return Err("The orchestration branch still has a worktree".into());
-        }
-        git(&root, &["branch", "-D", branch]).map(|_| ())
+        delete_orchestration_branch(&root, branch)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -910,6 +1077,65 @@ mod tests {
             "lead dirty\n"
         );
         remove(&root, worker, true).unwrap();
+    }
+
+    #[test]
+    fn composite_copy_mirrors_each_nested_checkout() {
+        let dir = repo();
+        let folder = dir.0.join("project");
+        let web = folder.join("web");
+        let api = folder.join("api");
+        for path in [&web, &api] {
+            std::fs::create_dir_all(path).unwrap();
+            git_checked(path, &["init", "-b", "main"]).unwrap();
+            git_checked(
+                path,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            )
+            .unwrap();
+        }
+        std::fs::write(web.join("dirty.txt"), "lead\n").unwrap();
+        std::fs::write(folder.join("notes.md"), "not a repo\n").unwrap();
+
+        let tree = create_seeded(&folder, "mc/orch-composite").unwrap();
+        let copy = Path::new(&tree.path);
+        assert_eq!(copy, default_root(&folder).join("mc-orch-composite"));
+        assert_eq!(
+            std::fs::read_to_string(copy.join("web/dirty.txt")).unwrap(),
+            "lead\n"
+        );
+        assert!(copy.join("api/.git").exists());
+        assert!(!copy.join("notes.md").exists());
+        assert_eq!(tree.branch.as_deref(), Some("mc/orch-composite"));
+
+        let listed = list(&folder).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed[0].is_main);
+        assert_eq!(listed[0].path, path_to_js(&folder));
+        assert_eq!(listed[1].head, listed[0].head);
+        assert_eq!(listed[1].branch.as_deref(), Some("mc/orch-composite"));
+        assert_eq!(
+            create_seeded(&folder, "mc/orch-composite").unwrap().path,
+            tree.path
+        );
+        assert!(check_removal(&folder, copy, false, false).is_err());
+
+        remove(&folder, copy, true).unwrap();
+        assert!(!copy.exists());
+        assert_eq!(list(&folder).unwrap().len(), 1);
+        delete_orchestration_branch(&folder, "mc/orch-composite").unwrap();
+        for path in [&web, &api] {
+            assert!(git(path, &["rev-parse", "--verify", "refs/heads/mc/orch-composite"]).is_err());
+        }
     }
 
     #[test]

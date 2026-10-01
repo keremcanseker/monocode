@@ -1861,7 +1861,7 @@ fn git_repo_diff_stats(root: &Path) -> GitDiffStats {
 /// How many folders below the project a nested checkout may sit.
 const NESTED_REPO_DEPTH: usize = 3;
 
-fn git_nested_repos_for(root: &Path) -> Vec<String> {
+pub(crate) fn git_nested_repos_for(root: &Path) -> Vec<String> {
     let mut repos = Vec::new();
     if git_is_work_tree(root) {
         repos.push(String::new());
@@ -1897,6 +1897,78 @@ fn git_nested_repos_for(root: &Path) -> Vec<String> {
     }
     repos.sort();
     repos
+}
+
+/// The checkout a folder-relative path belongs to, and the path inside it.
+/// A folder that is itself a repo owns everything below it; otherwise the
+/// innermost nested checkout on the way to the path does, and a path nothing
+/// claims stays with the folder.
+pub(crate) fn repo_for(root: &Path, relative: &str) -> (PathBuf, String) {
+    if !root.join(".git").exists() {
+        let parts: Vec<&str> = relative.split('/').filter(|part| !part.is_empty()).collect();
+        for split in (1..parts.len()).rev() {
+            let dir = root.join(parts[..split].join("/"));
+            if dir.join(".git").exists() {
+                return (dir, parts[split..].join("/"));
+            }
+        }
+    }
+    (root.to_path_buf(), relative.to_owned())
+}
+
+/// `git_diff_files_for` for a folder that is a repo or holds several: files
+/// from nested checkouts come back relative to the folder.
+pub(crate) fn composite_diff_files_for(root: &Path) -> GitDiffIndex {
+    if git_is_work_tree(root) {
+        return git_diff_files_for(root);
+    }
+    let mut index = GitDiffIndex::default();
+    for relative in git_nested_repos_for(root) {
+        let nested = git_diff_files_for(&root.join(&relative));
+        index.additions += nested.additions;
+        index.deletions += nested.deletions;
+        index.files.extend(nested.files.into_iter().map(|file| GitChangedFile {
+            relative: format!("{relative}/{}", file.relative),
+            ..file
+        }));
+    }
+    index
+}
+
+pub(crate) fn git_head(root: &Path) -> Result<Vec<u8>, String> {
+    let output = git_cmd()
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(output.stdout)
+}
+
+/// HEAD of a folder's checkout, or one entry per nested checkout when the
+/// folder itself is not a repo, so two such folders compare like two worktrees.
+pub(crate) fn composite_head(root: &Path) -> Result<Vec<u8>, String> {
+    if git_is_work_tree(root) {
+        return git_head(root);
+    }
+    let mut heads = Vec::new();
+    for relative in git_nested_repos_for(root) {
+        heads.extend_from_slice(relative.as_bytes());
+        heads.push(b':');
+        heads.extend(git_head(&root.join(&relative))?);
+    }
+    if heads.is_empty() {
+        return Err(format!(
+            "{} is not a git repository and holds none",
+            root.display()
+        ));
+    }
+    Ok(heads)
 }
 
 #[derive(Clone, Default)]
@@ -4477,7 +4549,7 @@ fn git_head_branch(root: &Path) -> Option<String> {
     git_stdout(root, &["symbolic-ref", "--short", "HEAD"]).filter(|branch| branch != "HEAD")
 }
 
-fn git_is_work_tree(root: &Path) -> bool {
+pub(crate) fn git_is_work_tree(root: &Path) -> bool {
     git_stdout(root, &["rev-parse", "--is-inside-work-tree"]).as_deref() == Some("true")
 }
 
@@ -6790,6 +6862,33 @@ mod tests {
 
         assert!(init_git(&dir.0, "main", None));
         assert_eq!(git_nested_repos_for(&dir.0), vec!["", "api", "apps/web"]);
+    }
+
+    #[test]
+    fn composite_helpers_follow_nested_checkouts() {
+        let dir = tmp("git-composite");
+        let web = dir.0.join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        if !init_git_commit(&web, &[("src/a.txt", "head\n")]) {
+            return;
+        }
+        std::fs::write(web.join("src/new.txt"), "one\n").unwrap();
+
+        let (repo, inner) = repo_for(&dir.0, "web/src/a.txt");
+        assert_eq!((repo.as_path(), inner.as_str()), (web.as_path(), "src/a.txt"));
+        assert_eq!(repo_for(&dir.0, "notes.md").0, dir.0);
+        assert_eq!(repo_for(&web, "src/a.txt").0, web);
+
+        let index = composite_diff_files_for(&dir.0);
+        let relatives: Vec<&str> = index.files.iter().map(|f| f.relative.as_str()).collect();
+        assert_eq!(relatives, ["web/src/new.txt"]);
+
+        let head = composite_head(&dir.0).unwrap();
+        assert!(head.starts_with(b"web:"));
+        assert_eq!(&head[4..], git_head(&web).unwrap().as_slice());
+        let empty = dir.0.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(composite_head(&empty).is_err());
     }
 
     #[test]

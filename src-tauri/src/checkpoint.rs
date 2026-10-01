@@ -11,8 +11,8 @@ use tauri::{AppHandle, Manager, State};
 #[cfg(test)]
 use crate::fs::GitDiffStats;
 use crate::fs::{
-    expand_home, git_checked, git_diff_files_for, path_to_js, resolve_repo_path, GitChangedFile,
-    GitDiffIndex, MAX_TEXT_FILE_BYTES,
+    composite_diff_files_for, composite_head, expand_home, git_checked, path_to_js, repo_for,
+    resolve_repo_path, GitChangedFile, GitDiffIndex, MAX_TEXT_FILE_BYTES,
 };
 
 const MAX_SNAPSHOT_FILES: usize = 500;
@@ -59,7 +59,7 @@ impl CheckpointStore {
 
         let mut files = BTreeMap::new();
         let mut tracked = BTreeSet::new();
-        for file in git_diff_files_for(&root).files {
+        for file in composite_diff_files_for(&root).files {
             if files.len() >= MAX_SNAPSHOT_FILES {
                 break;
             }
@@ -213,7 +213,7 @@ impl CheckpointStore {
         if same_cwd(from_cwd, to_cwd) {
             return Err("An isolated worker cannot be integrated into itself".into());
         }
-        if git_head(&from_root)? != git_head(&to_root)? {
+        if composite_head(&from_root)? != composite_head(&to_root)? {
             return Err(
                 "The worker or lead branch moved while this task was running. The worker worktree was kept for manual review."
                     .into(),
@@ -358,7 +358,7 @@ impl CheckpointStore {
             return Ok(out);
         }
         let root = project_root(cwd)?;
-        let index = git_diff_files_for(&root);
+        let index = composite_diff_files_for(&root);
         for session_id in session_ids {
             let Some(manifest) = self.load_matching(session_id, cwd)? else {
                 out.insert(session_id.clone(), GitDiffStats::default());
@@ -750,7 +750,7 @@ fn verified_worker_delta(
         ));
     }
 
-    let current_dirty: BTreeSet<String> = git_diff_files_for(root)
+    let current_dirty: BTreeSet<String> = composite_diff_files_for(root)
         .files
         .into_iter()
         .map(|file| file.relative)
@@ -871,21 +871,12 @@ fn path_contains_symlink(root: &Path, relative: &str) -> bool {
     false
 }
 
-fn git_head(root: &Path) -> Result<Vec<u8>, String> {
-    let mut command = Command::new("git");
-    crate::hide_window_console(&mut command);
-    let output = command
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "--verify", "HEAD"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    Ok(output.stdout)
+/// Run a path-taking git command in the checkout that owns `relative`.
+fn git_on_path(root: &Path, relative: &str, args: &[&str]) -> Result<(), String> {
+    let (repo, inner) = repo_for(root, relative);
+    let mut full = args.to_vec();
+    full.extend(["--", inner.as_str()]);
+    git_checked(&repo, &full)
 }
 
 fn diff_from_manifest(
@@ -895,7 +886,7 @@ fn diff_from_manifest(
     foreign_touched: &HashSet<String>,
 ) -> CheckpointStatus {
     diff_from_manifest_with(
-        &git_diff_files_for(root),
+        &composite_diff_files_for(root),
         dir,
         root,
         manifest,
@@ -1120,7 +1111,7 @@ fn restore_snapshot(
     match kind {
         SnapshotKind::Skipped => Ok(()),
         SnapshotKind::Missing => {
-            let _ = git_checked(root, &["reset", "-q", "HEAD", "--", relative]);
+            let _ = git_on_path(root, relative, &["reset", "-q", "HEAD"]);
             remove_worktree(root, relative)
         }
         SnapshotKind::Contents => {
@@ -1129,7 +1120,7 @@ fn restore_snapshot(
                 _ => return Ok(()),
             };
             write_worktree(&root.join(relative), &bytes)?;
-            let _ = git_checked(root, &["reset", "-q", "HEAD", "--", relative]);
+            let _ = git_on_path(root, relative, &["reset", "-q", "HEAD"]);
             Ok(())
         }
     }
@@ -1138,24 +1129,19 @@ fn restore_snapshot(
 fn revert_new_change(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
     if in_head(root, &relative) {
-        return git_checked(
+        return git_on_path(
             root,
-            &[
-                "restore",
-                "--source=HEAD",
-                "--staged",
-                "--worktree",
-                "--",
-                &relative,
-            ],
+            &relative,
+            &["restore", "--source=HEAD", "--staged", "--worktree"],
         );
     }
-    let _ = git_checked(root, &["reset", "-q", "HEAD", "--", &relative]);
+    let _ = git_on_path(root, &relative, &["reset", "-q", "HEAD"]);
     remove_worktree(root, &relative)
 }
 
 fn in_head(root: &Path, relative: &str) -> bool {
-    git_checked(root, &["cat-file", "-e", &format!("HEAD:{relative}")]).is_ok()
+    let (repo, inner) = repo_for(root, relative);
+    git_checked(&repo, &["cat-file", "-e", &format!("HEAD:{inner}")]).is_ok()
 }
 
 fn snapshot_file(dir: &Path, root: &Path, relative: &str) -> Result<SnapshotKind, String> {
@@ -1303,7 +1289,7 @@ fn remove_worktree(root: &Path, relative: &str) -> Result<(), String> {
         return Ok(());
     }
     if abs.is_dir() {
-        let _ = git_checked(root, &["clean", "-fd", "--", relative]);
+        let _ = git_on_path(root, relative, &["clean", "-fd"]);
         if abs.exists() {
             std::fs::remove_dir_all(&abs).map_err(|e| e.to_string())?;
         }
@@ -2058,6 +2044,45 @@ mod tests {
 
         std::fs::write(source.0.join("unreported.txt"), "unknown\n").unwrap();
         assert!(!store.cleanup_safe("worker", &from).unwrap());
+        assert!(store
+            .apply("worker", &from, &to)
+            .unwrap_err()
+            .contains("not captured"));
+    }
+
+    #[test]
+    fn composite_worker_delta_integrates_into_the_lead_folder() {
+        let lead = tmp("composite-lead");
+        let worker = tmp("composite-worker");
+        let lead_web = lead.0.join("web");
+        std::fs::create_dir_all(&lead_web).unwrap();
+        if !init_git_commit(&lead_web, &[("a.txt", "head\n")]) {
+            return;
+        }
+        let from_web = worker.0.join("web");
+        let (src, dst) = (lead_web.to_string_lossy(), from_web.to_string_lossy());
+        if !git(&lead.0, &["clone", &src, &dst]) {
+            return;
+        }
+        let from = worker.0.to_string_lossy().into_owned();
+        let to = lead.0.to_string_lossy().into_owned();
+        let (_root, store) = store();
+
+        store.ensure("worker", &from).unwrap();
+        assert!(in_head(&worker.0, "web/a.txt"));
+        store.prepare("worker", &from, &["web/a.txt".into()]).unwrap();
+        std::fs::write(from_web.join("a.txt"), "worker result\n").unwrap();
+        store.capture("worker", &from, &["web/a.txt".into()]).unwrap();
+        assert!(!store.cleanup_safe("worker", &from).unwrap());
+
+        let applied = store.apply("worker", &from, &to).unwrap();
+        assert_eq!(applied.files, ["web/a.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(lead_web.join("a.txt")).unwrap(),
+            "worker result\n"
+        );
+
+        std::fs::write(from_web.join("unreported.txt"), "unknown\n").unwrap();
         assert!(store
             .apply("worker", &from, &to)
             .unwrap_err()
