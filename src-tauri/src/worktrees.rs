@@ -423,7 +423,7 @@ fn checkout_state_matches(source: &Path, target: &Path) -> bool {
     })
 }
 
-fn create_seeded(root: &Path, branch: &str) -> Result<Worktree, String> {
+pub(crate) fn create_seeded(root: &Path, branch: &str) -> Result<Worktree, String> {
     if git_is_work_tree(root) {
         return create_seeded_at(root, branch, None);
     }
@@ -625,7 +625,7 @@ fn check_removal(root: &Path, path: &Path, force: bool, has_terminals: bool) -> 
     Ok(())
 }
 
-fn remove(root: &Path, path: &Path, force: bool) -> Result<(), String> {
+pub(crate) fn remove(root: &Path, path: &Path, force: bool) -> Result<(), String> {
     let tree = removal_target(root, path)?;
     if !git_is_work_tree(root) {
         let copy = Path::new(&tree.path);

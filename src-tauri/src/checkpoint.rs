@@ -2089,6 +2089,57 @@ mod tests {
             .contains("not captured"));
     }
 
+    /// The host's sequence for a worker in a folder of repos: seeded copy,
+    /// baseline before the first turn, edits reported as absolute paths,
+    /// integration into the folder, cleanup.
+    #[test]
+    fn composite_copy_round_trips_like_the_app() {
+        let lead = tmp("composite-app");
+        let folder = lead.0.join("project");
+        let mobile = folder.join("mobile");
+        std::fs::create_dir_all(&mobile).unwrap();
+        if !init_git_commit(&mobile, &[("src/a.txt", "head\n")]) {
+            return;
+        }
+        std::fs::write(mobile.join("src/seed.txt"), "lead dirty\n").unwrap();
+
+        let copy = crate::worktrees::create_seeded(&folder, "mc/orch-apptest").unwrap();
+        let copy_path = PathBuf::from(&copy.path);
+        let from = copy.path.clone();
+        let to = folder.to_string_lossy().into_owned();
+        let (_root, store) = store();
+
+        store.ensure("worker", &from).unwrap();
+        assert!(store.cleanup_safe("worker", &from).unwrap());
+        let edited = copy_path
+            .join("mobile/src/a.txt")
+            .to_string_lossy()
+            .into_owned();
+        store.prepare("worker", &from, &[edited.clone()]).unwrap();
+        std::fs::write(copy_path.join("mobile/src/a.txt"), "worker\n").unwrap();
+        store.capture("worker", &from, &[edited]).unwrap();
+        assert_eq!(
+            relatives(&store.status("worker", &from).unwrap()),
+            ["mobile/src/a.txt"]
+        );
+        assert!(!store.cleanup_safe("worker", &from).unwrap());
+
+        let applied = store.apply("worker", &from, &to).unwrap();
+        assert_eq!(applied.files, ["mobile/src/a.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(mobile.join("src/a.txt")).unwrap(),
+            "worker\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(mobile.join("src/seed.txt")).unwrap(),
+            "lead dirty\n"
+        );
+        assert_eq!(store.apply("worker", &from, &to).unwrap().already_applied, 1);
+
+        crate::worktrees::remove(&folder, &copy_path, true).unwrap();
+        assert!(!copy_path.exists());
+    }
+
     #[test]
     fn rejects_invalid_session_id() {
         let err = validate_id("../x", "session").unwrap_err();
