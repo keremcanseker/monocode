@@ -44,8 +44,9 @@ export function toolCallState(block: Block): ToolCallState {
     return "rejected";
   }
   if (needsApproval(block)) return "pending";
-  // A run the user stopped settled on purpose: it is neither still going nor
-  // a failure to open, count or colour red. Its row says "stopped" itself.
+  // A run that was stopped, by the user or by its turn ending first, settled
+  // on purpose: it is neither still going nor a failure to open, count or
+  // colour red. Its row says "stopped" itself.
   if (status === "completed" || status === "success" || status === "stopped")
     return "accepted";
   if (
@@ -360,7 +361,11 @@ export function groupTurns(blocks: Block[], managed = false): Block[][] {
  */
 export function groupTurnItems(
   blocks: Block[],
-  options?: { settled?: boolean },
+  options?: {
+    settled?: boolean;
+    /** Runs the turn under way still has going; see liveSubagents. */
+    running?: ReadonlySet<string>;
+  },
 ): TurnItem[] {
   const settled = options?.settled ?? false;
   const visible = withoutSupersededInitialThinking(
@@ -383,9 +388,14 @@ export function groupTurnItems(
     // is still going. Once the turn settles they are work like any other call
     // — except one that died: a failed run keeps its own row under the fold,
     // where it opens itself onto the reason rather than folding out of sight.
+    // So does one the turn under way still runs: a steer starts a new turn
+    // below it, and the run is still the row to watch, and the one the
+    // sidebar takes you to.
     if (
       isSubagentBlock(block) &&
-      (!settled || toolCallState(block) === "rejected")
+      (!settled ||
+        toolCallState(block) === "rejected" ||
+        !!options?.running?.has(block.id))
     ) {
       flush();
       const last = items[items.length - 1];
@@ -496,7 +506,10 @@ export function activityStillRunning(blocks: Block[]): boolean {
   );
 }
 
-/** A delegated run the user stopped before it reported back. */
+/**
+ * A delegated run stopped before it reported back: by the user, or by its
+ * turn ending, or the app closing, with nothing left to say how it went.
+ */
 export function isStoppedRun(block: Block): boolean {
   return block.tool?.status?.toLowerCase() === "stopped";
 }
@@ -581,20 +594,21 @@ export type LiveSubagent = {
 
 /**
  * The batch of delegated runs a session is waiting on, for the sidebar: every
- * run since the user message that preceded the oldest one still going. Empty
- * once nothing runs, so a finished batch leaves the card as it was.
+ * run of the turn under way, steers included. A run an earlier turn left open
+ * is not one this turn waits on. Empty once nothing runs, so a finished batch
+ * leaves the card as it was.
  */
 export function liveSubagents(blocks: Block[]): LiveSubagent[] {
-  let oldestRunning = -1;
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    const block = blocks[i];
-    if (isSubagentBlock(block) && subagentRunState(block) === "running")
-      oldestRunning = i;
+  const turn = blocks.slice(turnStartIndex(blocks));
+  if (
+    !turn.some(
+      (block) =>
+        isSubagentBlock(block) && subagentRunState(block) === "running",
+    )
+  ) {
+    return [];
   }
-  if (oldestRunning < 0) return [];
-  let start = oldestRunning;
-  while (start > 0 && blocks[start - 1].role !== "user") start -= 1;
-  return blocks.slice(start).flatMap((block): LiveSubagent[] =>
+  return turn.flatMap((block): LiveSubagent[] =>
     isSubagentBlock(block)
       ? [
           {
@@ -611,6 +625,21 @@ export function liveSubagents(blocks: Block[]): LiveSubagent[] {
         ]
       : [],
   );
+}
+
+/**
+ * Where the turn under way begins: after the message that started it. A steer
+ * written in while it ran carries no start time, so it does not count.
+ */
+function turnStartIndex(blocks: Block[]): number {
+  let lastUser = -1;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i].role !== "user") continue;
+    if (blocks[i].startedAt != null) return i + 1;
+    if (lastUser < 0) lastUser = i;
+  }
+  // Saved before turns were timed: the last message is the best guess.
+  return lastUser + 1;
 }
 
 export function hasRunningSubagent(blocks: Block[]): boolean {

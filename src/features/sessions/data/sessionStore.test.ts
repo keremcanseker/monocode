@@ -1,5 +1,5 @@
 import { appendUser } from "../../../integrations/harness/core/apply";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   newSession,
   type Block,
@@ -8,11 +8,15 @@ import {
 } from "../model/session";
 import {
   backfillClaudeShellCommands,
+  getSession,
   isPersistableId,
   persistFingerprint,
   sanitizeSessionForPersist,
   shouldPersistSession,
 } from "./sessionStore";
+
+const invoke = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 it("keeps host-owned transcripts out of local session storage", () => {
   const session = newSession("codex", "remote://env/home/me/repo");
@@ -53,6 +57,45 @@ describe("Claude Shell row recovery", () => {
     });
     expect(repaired[1]).toBe(blocks[1]);
     expect(backfillClaudeShellCommands(repaired, {})).toBe(repaired);
+  });
+});
+
+describe("reopening a saved session", () => {
+  it("stops a subagent saved mid-run and leaves the rest as it was saved", async () => {
+    const saved = newSession("claude", "/repo");
+    const tool = (id: string, kind: string, status: string): Block => ({
+      id,
+      role: "tool",
+      text: `Row ${id}`,
+      tool: { callId: `toolu_${id}`, kind, title: `Row ${id}`, status },
+    });
+    saved.blocks = [
+      { id: "u1", role: "user", text: "go", startedAt: 1 },
+      tool("open", "agent", "in_progress"),
+      tool("done", "agent", "completed"),
+      tool("shell", "execute", "in_progress"),
+    ];
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "session_get")
+        return {
+          ...sanitizeSessionForPersist(saved),
+          createdAt: 1,
+          updatedAt: 2,
+        };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const session = await getSession(saved.id);
+    expect(session?.blocks.map((block) => block.tool?.status)).toEqual([
+      undefined,
+      "stopped",
+      "completed",
+      "in_progress",
+    ]);
+    // Saving a session that is still running leaves its runs open.
+    expect(sanitizeSessionForPersist(saved).blocks[1]?.tool?.status).toBe(
+      "in_progress",
+    );
   });
 });
 

@@ -62,6 +62,7 @@ import {
   turnStatusFromResult,
   usageLimitFromRateLimitEvent,
   type ClaudeAgentTaskNotification,
+  type ClaudeAgentTaskStarted,
   type ClaudeCliSettings,
   type ClaudeControlRequest,
 } from "./claudeProtocol";
@@ -110,6 +111,7 @@ type InFlightTool = {
 
 type LiveAgentTask = {
   taskId: string;
+  /** The row the run shows on: its Agent call, or its own for a resumed run. */
   toolUseId?: string;
   description: string;
   backgrounded: boolean;
@@ -152,6 +154,19 @@ type Live = {
   taskNotes: string[];
   /** Agent calls the user stopped, whatever status Claude reports them with. */
   stoppedAgentCalls: Set<string>;
+  /**
+   * Agent rows already given a final status this turn. None is claimed again
+   * or takes another step: a straggler would set it spinning, or leave a call
+   * in its trail that never finishes. Steps closing out a call still land.
+   */
+  settledAgentRows: Set<string>;
+  /** Rows the task list ended before the task's own record said how. */
+  listEndedRows: Map<string, string>;
+  /**
+   * The Agent call each subagent was launched with, by task id. A run Claude
+   * resumes reports under that call again, so this outlives the turn.
+   */
+  agentOrigins: Map<string, string>;
   turnResultSeen: boolean;
   /** Latest `rate_limit_event` refused requests; reported when the turn ends. */
   usageLimit: { resetsAt?: number } | null;
@@ -466,6 +481,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     backgroundKey: "",
     taskNotes: [],
     stoppedAgentCalls: new Set(),
+    settledAgentRows: new Set(),
+    listEndedRows: new Map(),
+    agentOrigins: new Map(),
     turnResultSeen: false,
     usageLimit: null,
     cancelled: false,
@@ -558,6 +576,8 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   live.toolsByIndex.clear();
   live.toolsById.clear();
   live.agentTasks.clear();
+  live.settledAgentRows.clear();
+  live.listEndedRows.clear();
   live.backgroundTasks.clear();
   live.backgroundRows.clear();
   clearAwaitingResume(live);
@@ -874,6 +894,7 @@ function handleUser(live: Live, rec: Record<string, unknown>): void {
     if (isAgentToolName(tool.name) && isBackgroundedAgentTool(live, tool.id)) {
       continue;
     }
+    if (isAgentToolName(tool.name)) live.settledAgentRows.add(tool.id);
     live.onEvent({
       type: "tool.updated",
       callId: tool.id,
@@ -1162,25 +1183,30 @@ function handleAgentLifecycle(
     });
     syncBackgroundWait(live);
     if (!isAgentTaskType(started.taskType)) return true;
+    const { row, title } = agentRowForStart(live, started);
     live.agentTasks.set(started.taskId, {
       taskId: started.taskId,
-      toolUseId: started.toolUseId,
-      description: started.description,
+      toolUseId: row,
+      description: title,
       backgrounded: started.backgrounded,
     });
-    upsertAgentTool(
-      live,
-      started.toolUseId,
-      started.description,
-      "in_progress",
-    );
+    upsertAgentTool(live, row, title, "in_progress");
     return true;
   }
 
   const progress = parseTaskProgress(rec);
   if (progress) {
     const task = live.agentTasks.get(progress.taskId);
-    const title = progress.description || task?.description || "Subagent";
+    // Progress only moves the row the task already has, or its own Agent
+    // call's. Its tool_use_id can name the call that woke the run instead,
+    // and its description is what the run is doing now, not its name.
+    const call = progress.toolUseId
+      ? live.toolsById.get(progress.toolUseId)
+      : undefined;
+    const row =
+      task?.toolUseId ??
+      (call && isAgentToolName(call.name) ? call.id : undefined);
+    if (!row) return true;
     const detail =
       progress.summary ||
       progress.lastToolName ||
@@ -1189,8 +1215,8 @@ function handleAgentLifecycle(
         : undefined);
     upsertAgentTool(
       live,
-      progress.toolUseId ?? task?.toolUseId,
-      title,
+      row,
+      task?.description ?? "Subagent",
       "in_progress",
       detail,
     );
@@ -1255,15 +1281,19 @@ function handleAgentLifecycle(
     }
   }
   const liveTasks = allTasks.filter((task) => isAgentTaskType(task.taskType));
-  for (const id of [...live.agentTasks.keys()]) {
-    if (!next.has(id)) completeAgentTask(live, id, "completed");
+  for (const [id, task] of [...live.agentTasks]) {
+    // A run in the foreground is never on the list; its own result ends it.
+    if (next.has(id) || !task.backgrounded) continue;
+    completeAgentTask(live, id, "completed");
+    if (task.toolUseId) live.listEndedRows.set(id, task.toolUseId);
   }
   for (const row of liveTasks) {
     if (live.agentTasks.has(row.taskId)) continue;
     // The list carries no tool_use_id and often lands before task_started, so
     // a subagent Claude just launched would get a second row under its
-    // description. Claim its Agent call instead; only a task with no call on
-    // record (one already running when this process attached) gets its own.
+    // description. Claim its Agent call instead. A task with no open call to
+    // claim gets its row from task_started; a guessed row here was the one
+    // that stayed "running" after the real one finished.
     const toolUseId = unclaimedAgentCall(live, row.description);
     live.agentTasks.set(row.taskId, {
       taskId: row.taskId,
@@ -1271,7 +1301,9 @@ function handleAgentLifecycle(
       description: row.description,
       backgrounded: true,
     });
-    upsertAgentTool(live, toolUseId, row.description, "in_progress");
+    if (toolUseId) {
+      upsertAgentTool(live, toolUseId, row.description, "in_progress");
+    }
   }
   maybeFinishTurn(live);
   syncBackgroundWait(live);
@@ -1282,11 +1314,11 @@ function handleToolProgress(live: Live, rec: Record<string, unknown>): void {
   const progress = parseToolProgress(rec);
   if (!progress) return;
   const tool =
-    live.toolsById.get(progress.toolUseId) ??
+    agentRowOf(live, progress.toolUseId) ??
     (progress.parentToolUseId
-      ? live.toolsById.get(progress.parentToolUseId)
+      ? agentRowOf(live, progress.parentToolUseId)
       : undefined);
-  if (!tool || !isAgentToolName(tool.name)) return;
+  if (!tool || live.settledAgentRows.has(tool.id)) return;
   live.onEvent({
     type: "tool.updated",
     callId: tool.id,
@@ -1318,10 +1350,26 @@ function subagentParent(
   rec: Record<string, unknown>,
 ): InFlightTool | undefined {
   const parentId = stringField(rec, "parent_tool_use_id");
-  if (!parentId) return undefined;
-  const parent = live.toolsById.get(parentId);
-  if (!parent || !isAgentToolName(parent.name)) return undefined;
-  return parent;
+  return parentId ? agentRowOf(live, parentId) : undefined;
+}
+
+/**
+ * The row a subagent reporting under this Agent call runs on now. A run
+ * Claude resumed still reports under the call that first launched it, which
+ * has settled, so its steps go to the row it was given when it woke.
+ */
+function agentRowOf(live: Live, callId: string): InFlightTool | undefined {
+  for (const task of live.agentTasks.values()) {
+    if (
+      task.toolUseId &&
+      task.toolUseId !== callId &&
+      live.agentOrigins.get(task.taskId) === callId
+    ) {
+      return live.toolsById.get(task.toolUseId);
+    }
+  }
+  const tool = live.toolsById.get(callId);
+  return tool && isAgentToolName(tool.name) ? tool : undefined;
 }
 
 /**
@@ -1337,7 +1385,7 @@ function noteSubagentTool(
   input: Record<string, unknown>,
 ): void {
   const parent = subagentParent(live, rec);
-  if (!parent) return;
+  if (!parent || live.settledAgentRows.has(parent.id)) return;
   const title = toolTitle(name, input);
   // No detail: the Agent row's detail is the report the run hands back, and
   // writing the call of the moment there would leave whatever the subagent
@@ -1373,7 +1421,7 @@ function noteSubagentNarration(
   rec: Record<string, unknown>,
 ): void {
   const parent = subagentParent(live, rec);
-  if (!parent) return;
+  if (!parent || live.settledAgentRows.has(parent.id)) return;
   const model = stringField(asRecord(rec.message), "model");
   if (model)
     live.onEvent({
@@ -1435,11 +1483,59 @@ function unclaimedAgentCall(
   const wanted = description.trim();
   for (const tool of live.toolsById.values()) {
     if (!isAgentToolName(tool.name) || claimed.has(tool.id)) continue;
+    // A run that already ended keeps its row; a resumed one gets its own.
+    if (live.settledAgentRows.has(tool.id)) continue;
     if (stringField(tool.input, "description")?.trim() === wanted) {
       return tool.id;
     }
   }
   return undefined;
+}
+
+/**
+ * The row a started task runs on, and its name. A task launched by an Agent
+ * call runs on that call's row. One woken by another call, a SendMessage to a
+ * named agent that had finished, gets a row of its own: put on the SendMessage
+ * row, it turned that row into an agent and left its first row running.
+ */
+function agentRowForStart(
+  live: Live,
+  started: ClaudeAgentTaskStarted,
+): { row: string; title: string } {
+  const call = started.toolUseId
+    ? live.toolsById.get(started.toolUseId)
+    : undefined;
+  if (call && !isAgentToolName(call.name)) {
+    return {
+      row: `task:${started.taskId}:${call.id}`,
+      title: started.description,
+    };
+  }
+  if (started.toolUseId) {
+    // The task list may have handed this call to another run with the same
+    // description; that run takes the row this one was guessed onto instead.
+    const guessed = live.agentTasks.get(started.taskId)?.toolUseId;
+    for (const other of live.agentTasks.values()) {
+      if (
+        other.taskId !== started.taskId &&
+        other.toolUseId === started.toolUseId
+      ) {
+        other.toolUseId = guessed;
+      }
+    }
+    if (!live.agentOrigins.has(started.taskId)) {
+      live.agentOrigins.set(started.taskId, started.toolUseId);
+    }
+    return {
+      row: started.toolUseId,
+      title: call?.title || started.description,
+    };
+  }
+  const row =
+    live.agentTasks.get(started.taskId)?.toolUseId ??
+    unclaimedAgentCall(live, started.description) ??
+    `task:${started.taskId}`;
+  return { row, title: started.description };
 }
 
 function isBackgroundedAgentTool(live: Live, toolUseId: string): boolean {
@@ -1451,13 +1547,19 @@ function isBackgroundedAgentTool(live: Live, toolUseId: string): boolean {
 
 function upsertAgentTool(
   live: Live,
-  callId: string | undefined,
+  id: string,
   title: string,
   status: string,
   detail?: string,
 ): void {
-  const id = callId ?? `agent:${title}`;
+  const settles =
+    status !== "in_progress" && status !== "pending" && status !== "running";
+  if (!settles && live.settledAgentRows.has(id)) return;
   const existing = live.toolsById.get(id);
+  // Only an Agent call's row is a subagent's to move. Updating any other
+  // call, the SendMessage that woke a named agent, turned it into one.
+  if (existing && !isAgentToolName(existing.name)) return;
+  if (settles) live.settledAgentRows.add(id);
   if (!existing) {
     live.toolsById.set(id, {
       id,
@@ -1473,11 +1575,7 @@ function upsertAgentTool(
       kind: "agent",
       status,
     });
-    if (
-      status !== "in_progress" &&
-      status !== "pending" &&
-      status !== "running"
-    ) {
+    if (settles) {
       live.onEvent({
         type: "tool.updated",
         callId: id,
@@ -1489,7 +1587,10 @@ function upsertAgentTool(
     }
     return;
   }
-  if (title) existing.title = title;
+  // A row keeps the name it has; only a placeholder gives way.
+  if (title && (!existing.title || existing.title === "Subagent")) {
+    existing.title = title;
+  }
   live.onEvent({
     type: "tool.updated",
     callId: id,
@@ -1508,15 +1609,18 @@ function completeAgentTask(
 ): void {
   const task = live.agentTasks.get(taskId);
   live.agentTasks.delete(taskId);
-  if (task) {
-    const settled =
-      task.toolUseId && live.stoppedAgentCalls.has(task.toolUseId)
-        ? "stopped"
-        : status;
+  // The task list drops a run a moment before the run's own record says how
+  // it ended; a run that failed or was killed must not stay marked done. The
+  // first record after the list decides; the notice that follows repeats it.
+  const ended = live.listEndedRows.get(taskId);
+  live.listEndedRows.delete(taskId);
+  const row = task?.toolUseId ?? (status === "completed" ? undefined : ended);
+  if (row) {
+    const settled = live.stoppedAgentCalls.has(row) ? "stopped" : status;
     upsertAgentTool(
       live,
-      task.toolUseId,
-      task.description,
+      row,
+      task?.description ?? "Subagent",
       settled,
       detail ?? (settled === "failed" ? "Subagent failed." : undefined),
     );

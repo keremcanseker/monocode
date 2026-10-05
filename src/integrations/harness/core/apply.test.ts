@@ -1214,21 +1214,32 @@ describe("subagent clock", () => {
     ).toBe(3_500);
   });
 
-  it("stops the clock of a run still open when its turn ends", () => {
+  it("stops a run still open when its turn ends, clock and status", () => {
     let session = appendUser(newSession("claude", "/tmp"), "delegate");
     now = 1_000;
+    for (const callId of ["toolu_a", "toolu_b"]) {
+      session = applyHarnessEvent(session, {
+        type: "tool.started",
+        callId,
+        title: "Read the docs",
+        kind: "agent",
+        status: "in_progress",
+      });
+    }
     session = applyHarnessEvent(session, {
-      type: "tool.started",
-      callId: "toolu_a",
-      title: "Read the docs",
+      type: "tool.updated",
+      callId: "toolu_b",
       kind: "agent",
-      status: "in_progress",
+      status: "completed",
     });
     session = stopStreaming(session, 9_000);
-    expect(
-      session.blocks.find((block) => block.tool?.callId === "toolu_a")
-        ?.durationMs,
-    ).toBe(8_000);
+    const row = (callId: string) =>
+      session.blocks.find((block) => block.tool?.callId === callId);
+    expect(row("toolu_a")).toMatchObject({
+      durationMs: 8_000,
+      tool: { status: "stopped" },
+    });
+    expect(row("toolu_b")?.tool?.status).toBe("completed");
   });
 
   it("does not time ordinary tools", () => {
@@ -1244,5 +1255,6 @@ describe("subagent clock", () => {
     const tool = session.blocks.find((block) => block.tool?.callId === "bash");
     expect(tool?.startedAt).toBeUndefined();
     expect(tool?.durationMs).toBeUndefined();
+    expect(tool?.tool?.status).toBe("in_progress");
   });
 });

@@ -500,7 +500,7 @@ export function stopStreaming(session: Session, endedAt = Date.now()): Session {
     pendingQuestion: undefined,
     blocks: stampTurnDuration(
       settled.blocks.map((block) =>
-        stopAgentClock(stopBlockProgress(block), endedAt),
+        stopOpenAgentRun(stopAgentClock(stopBlockProgress(block), endedAt)),
       ),
       endedAt,
     ),
@@ -1006,6 +1006,28 @@ function stopAgentClock(block: Block, endedAt: number): Block {
     return block;
   }
   return { ...block, durationMs: Math.max(0, endedAt - block.startedAt) };
+}
+
+/**
+ * A run still open when its turn ends reads as stopped from then on. Left
+ * open, a run whose provider never reported its end would read as running for
+ * good and count as live again once the next turn starts. One a provider keeps
+ * going past its turn (pi's async runs) reads stopped too, until a later
+ * report on its row settles it.
+ */
+export function stopOpenAgentRun(block: Block): Block {
+  const status = block.tool?.status?.toLowerCase() ?? "";
+  if (
+    block.role !== "tool" ||
+    !block.tool ||
+    (status !== "in_progress" &&
+      status !== "pending" &&
+      status !== "running") ||
+    !isAgentTool(block.tool.kind, block.text || block.tool.title)
+  ) {
+    return block;
+  }
+  return { ...block, tool: { ...block.tool, status: "stopped" } };
 }
 
 const MAX_TOOL_DETAIL_CHARS = 8_000;

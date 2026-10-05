@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { stopOpenAgentRun } from "../../../integrations/harness/core/apply";
 import { titleFromToolInput } from "../../../integrations/harness/core/preview";
 import { recoverCursorSubagents } from "../../../integrations/harness/providers/cursor/cursorSubagents";
 import { persistableAttachment } from "../model/attachments";
@@ -670,7 +671,9 @@ function sanitizeBlock(
       next.notice = block.notice;
     }
   }
-  return next;
+  // No subagent outlives the app. One saved mid-run was cut off with it, and
+  // left open it would read as running in every turn after.
+  return options?.hydrate ? stopOpenAgentRun(next) : next;
 }
 
 function sanitizeNestedId(value: unknown): string | undefined {

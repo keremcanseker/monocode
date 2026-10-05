@@ -896,6 +896,27 @@ describe("the settled work trail", () => {
     ]);
   });
 
+  it("keeps a run the turn under way still has on its own row above a steer", () => {
+    const open: Block = {
+      ...agent("ag", "Quality review"),
+      tool: { kind: "agent", title: "Quality review", status: "in_progress" },
+    };
+    const turn = [
+      { id: "u", role: "user", text: "go" } as Block,
+      shell("t1"),
+      open,
+    ];
+    expect(
+      groupTurnItems(turn, { settled: true, running: new Set(["ag"]) }).map(
+        (item) => item.type,
+      ),
+    ).toEqual(["block", "activity", "subagents"]);
+    // A row an earlier turn left open is not one to pin.
+    expect(
+      groupTurnItems(turn, { settled: true }).map((item) => item.type),
+    ).toEqual(["block", "activity"]);
+  });
+
   it("spans the whole trail once settled, status rows and notes included", () => {
     const items = groupTurnItems(
       [
@@ -1542,7 +1563,13 @@ describe("subagent model labels", () => {
 });
 
 describe("subagent tracking", () => {
-  const user = (id: string): Block => ({ id, role: "user", text: "go" });
+  // A message that starts a turn carries its start time; a steer does not.
+  const user = (id: string, startedAt?: number): Block => ({
+    id,
+    role: "user",
+    text: "go",
+    ...(startedAt != null ? { startedAt } : {}),
+  });
   const run = (id: string, status: string, extra: Partial<Block> = {}): Block => ({
     id,
     role: "tool",
@@ -1566,9 +1593,9 @@ describe("subagent tracking", () => {
 
   it("lists the batch a busy session waits on, through a steer, and nothing once it is done", () => {
     const blocks = [
-      user("u1"),
+      user("u1", 1),
       run("old", "completed"),
-      user("u2"),
+      user("u2", 2),
       run("a", "completed", { durationMs: 4_000 }),
       run("b", "in_progress", { startedAt: 1_000 }),
       user("steer"),
@@ -1582,7 +1609,17 @@ describe("subagent tracking", () => {
       ["c", "failed"],
     ]);
     expect(liveSubagents(blocks)[1]).toMatchObject({ startedAt: 1_000 });
-    expect(liveSubagents([user("u1"), run("a", "completed")])).toEqual([]);
+    expect(liveSubagents([user("u1", 1), run("a", "completed")])).toEqual([]);
+  });
+
+  it("leaves out runs an earlier turn left open", () => {
+    const stale = [user("u1", 1), run("old", "in_progress"), user("u2", 2)];
+    expect(liveSubagents(stale)).toEqual([]);
+    expect(
+      liveSubagents([...stale, run("a", "in_progress")]).map(
+        (agent) => agent.blockId,
+      ),
+    ).toEqual(["a"]);
   });
 
   it("times a run from its start while it runs, by its record once settled", () => {

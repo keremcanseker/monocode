@@ -114,6 +114,7 @@ import {
   isSubagentBlock,
   isThinkingBlock,
   lastActivityIndex,
+  liveSubagents,
   isProseBlock,
   needsApproval,
   nestedScrollAbsorbsWheel,
@@ -494,6 +495,15 @@ function AgentTranscriptComponent({
   useTurnScrollAnchor(scrollerEl, visible, stickToBottom);
 
   const turns = groupTurns(blocks, managed);
+  // Runs the turn under way still has going, steers included. One a steer
+  // left in the turn above keeps its own live row there.
+  const runningSubagents = new Set(
+    busy
+      ? liveSubagents(blocks).flatMap((agent) =>
+          agent.state === "running" ? [agent.blockId] : [],
+        )
+      : [],
+  );
   const firstVisibleTurn = Math.max(0, turns.length - visibleTurnCount);
   const visibleTurns = turns.slice(firstVisibleTurn);
   const turnsRef = useRef(turns);
@@ -743,7 +753,7 @@ function AgentTranscriptComponent({
           // of the live work and append them after all of the lead's output.
           const items = groupTurnItems(
             turn.filter((block) => !block.orchestration),
-            { settled },
+            { settled, running: runningSubagents },
           );
           // Earlier activity groups have already been followed by prose or
           // more work. Only the last one can still be the live group.
@@ -821,7 +831,13 @@ function AgentTranscriptComponent({
                 key={item.blocks[0].id}
                 blocks={item.blocks}
                 cwd={cwd}
-                live={live}
+                // A run a steer left in the turn above still runs with this
+                // one, so it ticks and can be stopped the same.
+                live={
+                  live ||
+                  (visible &&
+                    item.blocks.some((block) => runningSubagents.has(block.id)))
+                }
                 onOpenFile={onOpenFile}
                 onOpenDiff={onOpenDiff}
               />

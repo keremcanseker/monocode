@@ -589,6 +589,33 @@ describe("AgentTranscript collapsed work", () => {
     expect(render(blocks, true)).not.toContain('aria-label="Stop ');
   });
 
+  it("keeps a run a steer left in the turn above live and stoppable", () => {
+    const blocks: Block[] = [
+      { id: "user", role: "user", text: "Research", startedAt: 1_000 },
+      { id: "note", role: "assistant", text: "Starting a reader." },
+      {
+        id: "a1",
+        role: "tool",
+        text: "Read the docs",
+        startedAt: 1_000,
+        tool: { callId: "toolu_a1", kind: "agent", status: "in_progress" },
+        agentRun: { name: "Read the docs", steps: [] },
+      },
+      { id: "steer", role: "user", text: "Also check the changelog" },
+      { id: "ack", role: "assistant", text: "Will do." },
+    ];
+    const markup = renderToStaticMarkup(
+      createElement(AgentTranscript, {
+        blocks,
+        busy: true,
+        subagentControls: { stop: async () => true },
+      }),
+    );
+
+    expect(markup).toContain('data-subagent-row="a1"');
+    expect(markup).toContain('aria-label="Stop Read the docs"');
+  });
+
   it("groups an opened subagent's trail the way the main transcript does", () => {
     const markup = render(
       [
