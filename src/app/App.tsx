@@ -2115,6 +2115,19 @@ export default function App({
     [],
   );
 
+  /**
+   * The title bar lists only the current project's tabs, so a tab shown from
+   * anywhere (a live agent, a notification) must bring its project along or
+   * the workspace changes while the title bar keeps the old project's tabs.
+   */
+  const followProject = useCallback((cwd: string | null | undefined) => {
+    if (!cwd || !looksLikeProject(cwd)) return;
+    const normalized = normalizeProjectPath(cwd);
+    if (sameProjectPath(normalized, projectCwdRef.current)) return;
+    setProjectCwd(normalized);
+    setRecents(rememberProject(normalized));
+  }, []);
+
   const activateTab = useCallback((id: string, paneId?: string) => {
     const tab = tabsRef.current.find((entry) => entry.id === id);
     const nextFocusedId =
@@ -2141,20 +2154,13 @@ export default function App({
       const focusedTab = nextFocusedId
         ? { ...tab, focusedId: nextFocusedId }
         : tab;
-      const cwd = focusedWorkspaceTabCwd(focusedTab, sessionsRef.current);
-      if (cwd && looksLikeProject(cwd)) {
-        const normalized = normalizeProjectPath(cwd);
-        if (!sameProjectPath(normalized, projectCwdRef.current)) {
-          setProjectCwd(normalized);
-          setRecents(rememberProject(normalized));
-        }
-      }
+      followProject(focusedWorkspaceTabCwd(focusedTab, sessionsRef.current));
     }
     setComposerFocused(
       !!nextFocusedId &&
         sessionsRef.current.some((session) => session.id === nextFocusedId),
     );
-  }, []);
+  }, [followProject]);
 
   const commitTabVisit = useCallback((history: TabVisitHistory) => {
     tabVisitRef.current = history;
@@ -3694,9 +3700,12 @@ export default function App({
         entry.id === tab.id ? { ...entry, focusedId: sessionId } : entry,
       ),
     );
+    followProject(
+      sessionsRef.current.find((session) => session.id === sessionId)?.cwd,
+    );
     setComposerFocused(true);
     return true;
-  }, []);
+  }, [followProject]);
 
   const replaceBlankPaneWithSession = useCallback((session: Session) => {
     const tab =
@@ -3712,6 +3721,17 @@ export default function App({
           isBlankSession(sessionsRef.current.find((entry) => entry.id === id)),
         );
     if (!paneId || paneId === session.id) return false;
+    // A blank pane belongs to its tab's project. Filling it with another
+    // project's session would move the whole tab out of the title bar.
+    const blankCwd = sessionsRef.current.find(
+      (entry) => entry.id === paneId,
+    )?.cwd;
+    if (
+      blankCwd &&
+      looksLikeProject(blankCwd) &&
+      !sameProjectPath(blankCwd, session.cwd)
+    )
+      return false;
 
     lastPersisted.current.delete(paneId);
     {
@@ -3736,9 +3756,10 @@ export default function App({
       ),
     );
     setActiveTabId(tab.id);
+    followProject(session.cwd);
     setComposerFocused(true);
     return true;
-  }, []);
+  }, [followProject]);
 
   const invalidateLoadedSession = useCallback((sessionId: string) => {
     openingSessionIds.current.delete(sessionId);
@@ -4085,6 +4106,7 @@ export default function App({
       const tab = newTab(session.id);
       appendTab(tab, session.cwd);
       setActiveTabId(tab.id);
+      followProject(session.cwd);
       setComposerFocused(true);
       if (linkedUpdate) revealLinkedSessionUpdate(session.id, linkedUpdate);
     },
@@ -4092,6 +4114,7 @@ export default function App({
       appendTab,
       ensureOpenSession,
       focusOpenSession,
+      followProject,
       replaceBlankPaneWithSession,
       revealLinkedSessionUpdate,
     ],
