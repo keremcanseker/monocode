@@ -1172,3 +1172,77 @@ describe("subagent steps", () => {
     expect(session.blocks[0].agentRun?.steps).toHaveLength(1);
   });
 });
+
+describe("subagent clock", () => {
+  it("times a delegated run from its start to the status it settles on", () => {
+    let session = appendUser(newSession("claude", "/tmp"), "delegate");
+    now = 1_000;
+    session = applyHarnessEvent(session, {
+      type: "tool.started",
+      callId: "toolu_a",
+      title: "Read the docs",
+      kind: "agent",
+      status: "in_progress",
+    });
+    now = 4_500;
+    session = applyHarnessEvent(session, {
+      type: "tool.updated",
+      callId: "toolu_a",
+      kind: "agent",
+      status: "stopped",
+    });
+    expect(
+      session.blocks.find((block) => block.tool?.callId === "toolu_a"),
+    ).toMatchObject({
+      startedAt: 1_000,
+      durationMs: 3_500,
+      streaming: false,
+      tool: { status: "stopped" },
+    });
+
+    now = 9_000;
+    session = applyHarnessEvent(session, {
+      type: "tool.updated",
+      callId: "toolu_a",
+      kind: "agent",
+      status: "stopped",
+      detail: "Stopped by the user",
+    });
+    expect(
+      session.blocks.find((block) => block.tool?.callId === "toolu_a")
+        ?.durationMs,
+    ).toBe(3_500);
+  });
+
+  it("stops the clock of a run still open when its turn ends", () => {
+    let session = appendUser(newSession("claude", "/tmp"), "delegate");
+    now = 1_000;
+    session = applyHarnessEvent(session, {
+      type: "tool.started",
+      callId: "toolu_a",
+      title: "Read the docs",
+      kind: "agent",
+      status: "in_progress",
+    });
+    session = stopStreaming(session, 9_000);
+    expect(
+      session.blocks.find((block) => block.tool?.callId === "toolu_a")
+        ?.durationMs,
+    ).toBe(8_000);
+  });
+
+  it("does not time ordinary tools", () => {
+    let session = appendUser(newSession("claude", "/tmp"), "run it");
+    session = applyHarnessEvent(session, {
+      type: "tool.started",
+      callId: "bash",
+      title: "ls",
+      kind: "execute",
+      status: "in_progress",
+    });
+    session = stopStreaming(session, 9_000);
+    const tool = session.blocks.find((block) => block.tool?.callId === "bash");
+    expect(tool?.startedAt).toBeUndefined();
+    expect(tool?.durationMs).toBeUndefined();
+  });
+});

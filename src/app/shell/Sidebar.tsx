@@ -1,5 +1,7 @@
 import { NO_BRANCH_LABEL } from "../../features/source-control/model/worktrees";
 import { OrchestrationSidebarAgents } from "../../features/orchestration/ui/OrchestrationSidebarAgents";
+import { SessionSubagents } from "../../features/sessions/ui/SessionSubagents";
+import type { LiveSubagent } from "../../features/sessions/model/transcriptActivity";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Archive,
@@ -288,6 +290,9 @@ type Props = {
   busyProjectPaths?: Iterable<string>;
   liveAgents?: LiveAgent[];
   onSelectAgent?: (sessionId: string) => void;
+  /** Claude's own subagents each busy session is waiting on, by session. */
+  subagentsBySession?: ReadonlyMap<string, LiveSubagent[]>;
+  onRevealSubagent?: (sessionId: string, blockId: string) => void;
   onSelectProject?: (path: string) => void;
   onOpenProject?: () => void;
   onRemoveProject?: (path: string, options: { purgeData: boolean }) => void;
@@ -377,6 +382,8 @@ function SidebarComponent({
   busyProjectPaths,
   liveAgents = [],
   onSelectAgent,
+  subagentsBySession,
+  onRevealSubagent,
   onSelectProject,
   onOpenProject,
   onRemoveProject,
@@ -1466,6 +1473,8 @@ function SidebarComponent({
         dropTarget={isSessionDrop("session", session.id)}
         compact={compact}
         now={now}
+        subagents={subagentsBySession?.get(session.id)}
+        onRevealSubagent={onRevealSubagent}
         onSelect={cardActions.select}
         onOpenWorkItem={onOpenInboxItem && !remoteProject ? cardActions.openWorkItem : undefined}
         onPrefetch={onPrefetchSession ? cardActions.prefetch : undefined}
@@ -2940,6 +2949,8 @@ const SessionCard = memo(function SessionCard({
   dropTarget,
   compact = false,
   now,
+  subagents,
+  onRevealSubagent,
   onSelect,
   onOpenWorkItem,
   onPrefetch,
@@ -2961,6 +2972,8 @@ const SessionCard = memo(function SessionCard({
   dropTarget?: boolean;
   compact?: boolean;
   now: number;
+  subagents?: LiveSubagent[];
+  onRevealSubagent?: (sessionId: string, blockId: string) => void;
   onSelect: (
     sessionId: string,
     event: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
@@ -3348,6 +3361,13 @@ const SessionCard = memo(function SessionCard({
           <OrchestrationSidebarAgents
             leadId={session.id}
             summary={orchestration!}
+          />
+        ) : null}
+        {/* Claude's own subagents, kept apart from an orchestration's agents. */}
+        {!orchestration && subagents?.length ? (
+          <SessionSubagents
+            subagents={subagents}
+            onReveal={(blockId) => onRevealSubagent?.(session.id, blockId)}
           />
         ) : null}
         <span className="relative mt-1 flex items-center gap-2">

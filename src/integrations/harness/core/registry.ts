@@ -72,6 +72,8 @@ export type HarnessAdapter = {
   keepQuestionOpen?(sessionId: string, requestId: number): void;
   /** Kill the child but keep resume state for later rebind. */
   stopSession(sessionId: string): Promise<void>;
+  /** Stop one running subagent by its Agent tool call; false if it is not one. */
+  stopSubagent?(sessionId: string, callId: string): Promise<boolean>;
   /** Drop resume state and kill the child (delete, harness switch, idle detach). */
   forgetSession(sessionId: string): Promise<void>;
   /** Seed resume state from a restored MonoCode session. */
@@ -335,6 +337,21 @@ export function keepHarnessQuestionOpen(
   requestId: number,
 ): void {
   getHarness(harness)?.keepQuestionOpen?.(sessionId, requestId);
+}
+
+export function canStopHarnessSubagent(harness: HarnessId): boolean {
+  const adapter = getHarness(harness);
+  return !!adapter?.live && !!adapter.stopSubagent;
+}
+
+export async function stopHarnessSubagent(
+  harness: HarnessId,
+  sessionId: string,
+  callId: string,
+): Promise<boolean> {
+  const adapter = getHarness(harness);
+  if (!adapter?.live || !adapter.stopSubagent) return false;
+  return adapter.stopSubagent(sessionId, callId);
 }
 
 export async function stopHarnessSession(

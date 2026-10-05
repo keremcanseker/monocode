@@ -181,6 +181,8 @@ export {
   respondHarnessQuestion,
   keepHarnessQuestionOpen,
   stopHarnessSession,
+  canStopHarnessSubagent,
+  stopHarnessSubagent,
   forgetHarnessSession,
   bindHarnessSession,
   refreshHarnessCatalogs,

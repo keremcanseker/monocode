@@ -458,6 +458,11 @@ import {
 } from "../features/sessions/ui/TranscriptPool";
 import { syncDockBadge } from "../features/notifications/model/dockBadge";
 import { liveAgentsFromSessions } from "../features/sessions/model/liveAgents";
+import {
+  liveSubagents,
+  type LiveSubagent,
+} from "../features/sessions/model/transcriptActivity";
+import { requestSubagentReveal } from "../features/sessions/model/subagentReveal";
 import { hiddenApprovalNotices } from "../features/notifications/model/approvalToast";
 import { useSessionReminders } from "../features/notifications/hooks/useSessionReminders";
 import { ReminderNotices } from "../features/sessions/ui/ReminderNotices";
@@ -1691,6 +1696,18 @@ export default function App({
     [liveAgentsEnabled, sessions, unseenFinishedIds],
   );
 
+  // Only a busy session can be waiting on subagents, and only its current
+  // batch matters, so this stays a short walk per busy session.
+  const subagentsBySession = useMemo(() => {
+    const bySession = new Map<string, LiveSubagent[]>();
+    for (const session of sessions) {
+      if (!session.busy) continue;
+      const runs = liveSubagents(session.blocks);
+      if (runs.length) bySession.set(session.id, runs);
+    }
+    return bySession;
+  }, [sessions]);
+
   const hiddenApprovalToasts = useMemo(
     () => hiddenApprovalNotices(sessions, activeTabId, tabs, composerFocused),
     [sessions, activeTabId, tabs, composerFocused],
@@ -2128,39 +2145,42 @@ export default function App({
     setRecents(rememberProject(normalized));
   }, []);
 
-  const activateTab = useCallback((id: string, paneId?: string) => {
-    const tab = tabsRef.current.find((entry) => entry.id === id);
-    const nextFocusedId =
-      tab &&
-      paneId &&
-      (leafIds(tab.layout).includes(paneId) ||
-        tab.editorPanes.some((entry) => entry.id === paneId) ||
-        (tab.terminalPanes ?? []).some((entry) => entry.id === paneId))
-        ? paneId
-        : tab?.focusedId;
+  const activateTab = useCallback(
+    (id: string, paneId?: string) => {
+      const tab = tabsRef.current.find((entry) => entry.id === id);
+      const nextFocusedId =
+        tab &&
+        paneId &&
+        (leafIds(tab.layout).includes(paneId) ||
+          tab.editorPanes.some((entry) => entry.id === paneId) ||
+          (tab.terminalPanes ?? []).some((entry) => entry.id === paneId))
+          ? paneId
+          : tab?.focusedId;
 
-    setActiveTabId(id);
-    if (tab && nextFocusedId && nextFocusedId !== tab.focusedId) {
-      setTabs((prev) =>
-        prev.map((entry) =>
-          entry.id === id
-            ? { ...entry, focusedId: nextFocusedId, diffFocused: false }
-            : entry,
-        ),
+      setActiveTabId(id);
+      if (tab && nextFocusedId && nextFocusedId !== tab.focusedId) {
+        setTabs((prev) =>
+          prev.map((entry) =>
+            entry.id === id
+              ? { ...entry, focusedId: nextFocusedId, diffFocused: false }
+              : entry,
+          ),
+        );
+      }
+
+      if (tab) {
+        const focusedTab = nextFocusedId
+          ? { ...tab, focusedId: nextFocusedId }
+          : tab;
+        followProject(focusedWorkspaceTabCwd(focusedTab, sessionsRef.current));
+      }
+      setComposerFocused(
+        !!nextFocusedId &&
+          sessionsRef.current.some((session) => session.id === nextFocusedId),
       );
-    }
-
-    if (tab) {
-      const focusedTab = nextFocusedId
-        ? { ...tab, focusedId: nextFocusedId }
-        : tab;
-      followProject(focusedWorkspaceTabCwd(focusedTab, sessionsRef.current));
-    }
-    setComposerFocused(
-      !!nextFocusedId &&
-        sessionsRef.current.some((session) => session.id === nextFocusedId),
-    );
-  }, [followProject]);
+    },
+    [followProject],
+  );
 
   const commitTabVisit = useCallback((history: TabVisitHistory) => {
     tabVisitRef.current = history;
@@ -3686,80 +3706,88 @@ export default function App({
     [activateTab],
   );
 
-  const focusOpenSession = useCallback((sessionId: string) => {
-    const tab = findOpenSessionTab(
-      tabsRef.current,
-      sessionsRef.current,
-      sessionId,
-    );
-    if (!tab) return false;
-    loadedSessionCache.current.delete(sessionId);
-    setActiveTabId(tab.id);
-    setTabs((prev) =>
-      prev.map((entry) =>
-        entry.id === tab.id ? { ...entry, focusedId: sessionId } : entry,
-      ),
-    );
-    followProject(
-      sessionsRef.current.find((session) => session.id === sessionId)?.cwd,
-    );
-    setComposerFocused(true);
-    return true;
-  }, [followProject]);
+  const focusOpenSession = useCallback(
+    (sessionId: string) => {
+      const tab = findOpenSessionTab(
+        tabsRef.current,
+        sessionsRef.current,
+        sessionId,
+      );
+      if (!tab) return false;
+      loadedSessionCache.current.delete(sessionId);
+      setActiveTabId(tab.id);
+      setTabs((prev) =>
+        prev.map((entry) =>
+          entry.id === tab.id ? { ...entry, focusedId: sessionId } : entry,
+        ),
+      );
+      followProject(
+        sessionsRef.current.find((session) => session.id === sessionId)?.cwd,
+      );
+      setComposerFocused(true);
+      return true;
+    },
+    [followProject],
+  );
 
-  const replaceBlankPaneWithSession = useCallback((session: Session) => {
-    const tab =
-      tabsRef.current.find((entry) => entry.id === activeTabIdRef.current) ??
-      tabsRef.current[0];
-    if (!tab) return false;
+  const replaceBlankPaneWithSession = useCallback(
+    (session: Session) => {
+      const tab =
+        tabsRef.current.find((entry) => entry.id === activeTabIdRef.current) ??
+        tabsRef.current[0];
+      if (!tab) return false;
 
-    const paneId = isBlankSession(
-      sessionsRef.current.find((entry) => entry.id === tab.focusedId),
-    )
-      ? tab.focusedId
-      : leafIds(tab.layout).find((id) =>
-          isBlankSession(sessionsRef.current.find((entry) => entry.id === id)),
-        );
-    if (!paneId || paneId === session.id) return false;
-    // A blank pane belongs to its tab's project. Filling it with another
-    // project's session would move the whole tab out of the title bar.
-    const blankCwd = sessionsRef.current.find(
-      (entry) => entry.id === paneId,
-    )?.cwd;
-    if (
-      blankCwd &&
-      looksLikeProject(blankCwd) &&
-      !sameProjectPath(blankCwd, session.cwd)
-    )
-      return false;
+      const paneId = isBlankSession(
+        sessionsRef.current.find((entry) => entry.id === tab.focusedId),
+      )
+        ? tab.focusedId
+        : leafIds(tab.layout).find((id) =>
+            isBlankSession(
+              sessionsRef.current.find((entry) => entry.id === id),
+            ),
+          );
+      if (!paneId || paneId === session.id) return false;
+      // A blank pane belongs to its tab's project. Filling it with another
+      // project's session would move the whole tab out of the title bar.
+      const blankCwd = sessionsRef.current.find(
+        (entry) => entry.id === paneId,
+      )?.cwd;
+      if (
+        blankCwd &&
+        looksLikeProject(blankCwd) &&
+        !sameProjectPath(blankCwd, session.cwd)
+      )
+        return false;
 
-    lastPersisted.current.delete(paneId);
-    {
-      const blank = sessionsRef.current.find((entry) => entry.id === paneId);
-      if (blank) void forgetHarnessSession(blank.harness, paneId);
-    }
-    setSessions((prev) => {
-      const next = prev.filter((entry) => entry.id !== paneId);
-      return next.some((entry) => entry.id === session.id)
-        ? next
-        : [...next, session];
-    });
-    setTabs((prev) =>
-      prev.map((entry) =>
-        entry.id === tab.id
-          ? {
-              ...entry,
-              layout: replaceLeafId(entry.layout, paneId, session.id),
-              focusedId: session.id,
-            }
-          : entry,
-      ),
-    );
-    setActiveTabId(tab.id);
-    followProject(session.cwd);
-    setComposerFocused(true);
-    return true;
-  }, [followProject]);
+      lastPersisted.current.delete(paneId);
+      {
+        const blank = sessionsRef.current.find((entry) => entry.id === paneId);
+        if (blank) void forgetHarnessSession(blank.harness, paneId);
+      }
+      setSessions((prev) => {
+        const next = prev.filter((entry) => entry.id !== paneId);
+        return next.some((entry) => entry.id === session.id)
+          ? next
+          : [...next, session];
+      });
+      setTabs((prev) =>
+        prev.map((entry) =>
+          entry.id === tab.id
+            ? {
+                ...entry,
+                layout: replaceLeafId(entry.layout, paneId, session.id),
+                focusedId: session.id,
+              }
+            : entry,
+        ),
+      );
+      setActiveTabId(tab.id);
+      followProject(session.cwd);
+      setComposerFocused(true);
+      return true;
+    },
+    [followProject],
+  );
 
   const invalidateLoadedSession = useCallback((sessionId: string) => {
     openingSessionIds.current.delete(sessionId);
@@ -9456,6 +9484,16 @@ export default function App({
     [onOpenApprovalSession],
   );
 
+  // The request waits for the session's pane to be on screen, so it can be
+  // made before the tab switch that shows it.
+  const onRevealSubagent = useCallback(
+    (sessionId: string, blockId: string) => {
+      requestSubagentReveal(sessionId, blockId);
+      onSelectLiveAgent(sessionId);
+    },
+    [onSelectLiveAgent],
+  );
+
   const nextTitleTabs: TitleTab[] = deckProjectTabs.map((tab) =>
     toTitleTab(tab, sessions, dirtyFiles, unseenFinishedIds),
   );
@@ -10617,6 +10655,8 @@ export default function App({
               )}
               liveAgents={liveAgents}
               onSelectAgent={onSelectLiveAgent}
+              subagentsBySession={subagentsBySession}
+              onRevealSubagent={onRevealSubagent}
               onSelectProject={onSelectProject}
               onOpenProject={pickProject}
               onRemoveProject={onRemoveProject}

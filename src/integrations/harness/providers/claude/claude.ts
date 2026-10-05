@@ -150,6 +150,8 @@ type Live = {
   backgroundKey: string;
   /** Finished-subagent notes held until Claude picks the thread back up. */
   taskNotes: string[];
+  /** Agent calls the user stopped, whatever status Claude reports them with. */
+  stoppedAgentCalls: Set<string>;
   turnResultSeen: boolean;
   /** Latest `rate_limit_event` refused requests; reported when the turn ends. */
   usageLimit: { resetsAt?: number } | null;
@@ -333,6 +335,32 @@ export async function cancelClaudeTurn(sessionId: string): Promise<void> {
   ]);
 }
 
+/**
+ * Stop one subagent and let the rest of the turn carry on. Claude reports the
+ * task ended and wakes up to whatever the other runs bring back. False when
+ * the call is not a subagent this session is still running.
+ */
+export async function stopClaudeSubagent(
+  sessionId: string,
+  callId: string,
+): Promise<boolean> {
+  const live = liveByThread.get(sessionId);
+  if (!live) return false;
+  const task = [...live.agentTasks.values()].find(
+    (entry) => entry.toolUseId === callId,
+  );
+  if (!task) return false;
+  live.stoppedAgentCalls.add(callId);
+  await writeJson(
+    sessionId,
+    buildControlRequest(nextControlId(live), {
+      subtype: "stop_task",
+      task_id: task.taskId,
+    }),
+  );
+  return true;
+}
+
 export async function stopClaudeSession(sessionId: string): Promise<void> {
   cancelledThreads.delete(sessionId);
   const live = liveByThread.get(sessionId);
@@ -437,6 +465,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     awaitingResume: null,
     backgroundKey: "",
     taskNotes: [],
+    stoppedAgentCalls: new Set(),
     turnResultSeen: false,
     usageLimit: null,
     cancelled: false,
@@ -850,7 +879,11 @@ function handleUser(live: Live, rec: Record<string, unknown>): void {
       callId: tool.id,
       title: tool.title,
       kind: toolKindFromName(tool.name),
-      status: result.isError ? "failed" : "completed",
+      status: live.stoppedAgentCalls.has(tool.id)
+        ? "stopped"
+        : result.isError
+          ? "failed"
+          : "completed",
       detail: result.text || undefined,
       preview: previewFromTool(tool.name, tool.input, result.text),
     });
@@ -1186,7 +1219,7 @@ function handleAgentLifecycle(
       completeAgentTask(
         live,
         updated.taskId,
-        updated.status === "completed" ? "completed" : "failed",
+        agentRowStatus(updated.status),
         updated.error,
       );
     }
@@ -1201,7 +1234,7 @@ function handleAgentLifecycle(
       completeAgentTask(
         live,
         notice.taskId,
-        notice.status === "completed" ? "completed" : "failed",
+        agentRowStatus(notice.status),
         notice.summary || undefined,
       );
     }
@@ -1476,15 +1509,27 @@ function completeAgentTask(
   const task = live.agentTasks.get(taskId);
   live.agentTasks.delete(taskId);
   if (task) {
+    const settled =
+      task.toolUseId && live.stoppedAgentCalls.has(task.toolUseId)
+        ? "stopped"
+        : status;
     upsertAgentTool(
       live,
       task.toolUseId,
       task.description,
-      status,
-      detail ?? (status === "failed" ? "Subagent failed." : undefined),
+      settled,
+      detail ?? (settled === "failed" ? "Subagent failed." : undefined),
     );
   }
   maybeFinishTurn(live);
+}
+
+/** How a finished task's row reads: done, stopped on purpose, or failed. */
+function agentRowStatus(status: string | undefined): string {
+  const key = (status ?? "").toLowerCase();
+  if (key === "completed") return "completed";
+  if (key === "killed" || key === "stopped") return "stopped";
+  return "failed";
 }
 
 /**

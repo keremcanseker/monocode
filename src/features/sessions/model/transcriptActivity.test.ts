@@ -18,9 +18,16 @@ import {
   proseSummary,
   resolveToolCallDisplay,
   isSubagentBlock,
+  formatElapsed,
+  liveSubagents,
   subagentBrief,
+  subagentElapsed,
   subagentFailureSummary,
   subagentName,
+  subagentRunState,
+  subagentTally,
+  subagentTallyLine,
+  toolCallState,
   toolCallLabel,
   turnCopyText,
   subagentModelName,
@@ -1531,5 +1538,78 @@ describe("subagent model labels", () => {
     expect(subagentModelName(row("custom-model-v2"))).toBe("custom-model-v2");
     for (const model of [undefined, "", "auto", "inherit", "default"])
       expect(subagentModelName(row(model))).toBeUndefined();
+  });
+});
+
+describe("subagent tracking", () => {
+  const user = (id: string): Block => ({ id, role: "user", text: "go" });
+  const run = (id: string, status: string, extra: Partial<Block> = {}): Block => ({
+    id,
+    role: "tool",
+    text: `Research ${id}`,
+    tool: {
+      callId: `toolu_${id}`,
+      kind: "agent",
+      title: `Research ${id}`,
+      status,
+    },
+    ...extra,
+  });
+
+  it("treats a run the user stopped as settled, not failed", () => {
+    const stopped = run("a", "stopped");
+    expect(toolCallState(stopped)).toBe("accepted");
+    expect(subagentRunState(stopped)).toBe("stopped");
+    expect(subagentFailureSummary([stopped])).toBeUndefined();
+    expect(subagentRunState(run("b", "failed"))).toBe("failed");
+  });
+
+  it("lists the batch a busy session waits on, through a steer, and nothing once it is done", () => {
+    const blocks = [
+      user("u1"),
+      run("old", "completed"),
+      user("u2"),
+      run("a", "completed", { durationMs: 4_000 }),
+      run("b", "in_progress", { startedAt: 1_000 }),
+      user("steer"),
+      run("c", "failed"),
+    ];
+    expect(
+      liveSubagents(blocks).map((agent) => [agent.blockId, agent.state]),
+    ).toEqual([
+      ["a", "done"],
+      ["b", "running"],
+      ["c", "failed"],
+    ]);
+    expect(liveSubagents(blocks)[1]).toMatchObject({ startedAt: 1_000 });
+    expect(liveSubagents([user("u1"), run("a", "completed")])).toEqual([]);
+  });
+
+  it("times a run from its start while it runs, by its record once settled", () => {
+    expect(
+      subagentElapsed(run("a", "in_progress", { startedAt: 1_000 }), 61_000),
+    ).toBe(60_000);
+    expect(
+      subagentElapsed(
+        run("a", "completed", { startedAt: 1_000, durationMs: 5_000 }),
+        99_000,
+      ),
+    ).toBe(5_000);
+    // Saved before runs were timed: no made-up clock.
+    expect(subagentElapsed(run("a", "in_progress"), 99_000)).toBeNull();
+    expect(formatElapsed(61_000)).toBe("1m 1s");
+    expect(formatElapsed(800)).toBe("1s");
+  });
+
+  it("sums a stack of runs into one line, leaving out empty counts", () => {
+    const tally = subagentTally([
+      run("a", "in_progress"),
+      run("b", "in_progress"),
+      run("c", "completed"),
+      run("d", "stopped"),
+    ]);
+    expect(subagentTallyLine(tally)).toBe(
+      "4 subagents · 2 running · 1 done · 1 stopped",
+    );
   });
 });

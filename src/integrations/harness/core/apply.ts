@@ -11,6 +11,7 @@ import { mergeContextUsage } from "../../../features/sessions/model/contextUsage
 import { displayPath } from "../../../shared/lib/paths";
 import {
   composeToolTitle,
+  isAgentTool,
   isFileTool,
   isWeakToolTitle,
   mergeToolPreview,
@@ -86,7 +87,10 @@ export function applyHarnessEvent(
         status: event.status,
         detail: event.detail,
         preview: event.preview,
-        streaming: event.status !== "completed" && event.status !== "failed",
+        streaming:
+          event.status !== "completed" &&
+          event.status !== "failed" &&
+          event.status !== "stopped",
         agentModel: event.agentModel,
       });
     case "agent.step":
@@ -494,7 +498,12 @@ export function stopStreaming(session: Session, endedAt = Date.now()): Session {
     ...settled,
     busy: false,
     pendingQuestion: undefined,
-    blocks: stampTurnDuration(settled.blocks.map(stopBlockProgress), endedAt),
+    blocks: stampTurnDuration(
+      settled.blocks.map((block) =>
+        stopAgentClock(stopBlockProgress(block), endedAt),
+      ),
+      endedAt,
+    ),
   };
 }
 
@@ -892,6 +901,8 @@ function upsertTool(
       role: "tool",
       text: label,
       streaming: patch.streaming,
+      // A delegated run is timed from here; see settleAgentClock.
+      ...(isAgentTool(patch.kind, label) ? { startedAt: Date.now() } : {}),
       ...(patch.agentModel
         ? { agentRun: { name: label, model: patch.agentModel, steps: [] } }
         : {}),
@@ -939,6 +950,7 @@ function upsertTool(
   const blocks = session.blocks.slice();
   blocks[index] = {
     ...prev,
+    ...settleAgentClock(prev, status),
     text: label,
     streaming: patch.streaming,
     ...(patch.agentModel || prev.agentRun
@@ -962,6 +974,38 @@ function upsertTool(
     },
   };
   return { ...session, blocks };
+}
+
+const SETTLED_TOOL_STATUSES = new Set([
+  "completed",
+  "success",
+  "failed",
+  "error",
+  "stopped",
+  "cancelled",
+  "canceled",
+]);
+
+/** A timed run's duration, stamped once, when it first settles. */
+function settleAgentClock(
+  block: Block,
+  status: string | undefined,
+): Pick<Block, "durationMs"> | null {
+  if (block.startedAt == null || block.durationMs != null) return null;
+  if (!SETTLED_TOOL_STATUSES.has(status?.toLowerCase() ?? "")) return null;
+  return { durationMs: Math.max(0, Date.now() - block.startedAt) };
+}
+
+/** A run still open when its turn ends stops counting at the turn's end. */
+function stopAgentClock(block: Block, endedAt: number): Block {
+  if (
+    block.role !== "tool" ||
+    block.startedAt == null ||
+    block.durationMs != null
+  ) {
+    return block;
+  }
+  return { ...block, durationMs: Math.max(0, endedAt - block.startedAt) };
 }
 
 const MAX_TOOL_DETAIL_CHARS = 8_000;

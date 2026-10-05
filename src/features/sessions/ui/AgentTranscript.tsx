@@ -10,7 +10,9 @@ import {
   PenLine,
   Bot,
   ChartBreakoutSquare,
+  Loader,
   Search,
+  Square,
   Terminal,
   Trash2,
   Wrench,
@@ -20,6 +22,7 @@ import {
   memo,
   startTransition,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -81,6 +84,14 @@ import {
 } from "../model/session";
 import { HarnessIcon } from "./HarnessIcon";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
+import { useNow } from "../../../shared/hooks/useNow";
+import {
+  SubagentControls,
+  SubagentReveal,
+  type SubagentControlsValue,
+} from "./subagentControls";
+
+const NO_SUBAGENT_CONTROLS: SubagentControlsValue = {};
 import { useTranscriptLayout } from "../hooks/useTranscriptLayout";
 import { useTranscriptAnchor } from "../hooks/useTranscriptAnchor";
 import { useTranscriptSelection } from "../hooks/useTranscriptSelection";
@@ -108,10 +119,15 @@ import {
   nestedScrollAbsorbsWheel,
   proseSummary,
   resolveToolCallDisplay,
+  formatElapsed,
   subagentBrief,
+  subagentElapsed,
   subagentModelName,
   subagentName,
   subagentReport,
+  subagentRunState,
+  subagentTally,
+  subagentTallyLine,
   toolCallLabel,
   toolCallState,
   turnCopyText,
@@ -193,6 +209,10 @@ type Props = {
   onNavigateReady?: (
     navigate: (blockId: string | null, query?: string) => boolean,
   ) => void;
+  /** Passes a function that scrolls to a subagent's row and opens it. */
+  onSubagentRevealReady?: (reveal: (blockId: string) => boolean) => void;
+  /** What a subagent row may do to its run; absent where the harness cannot. */
+  subagentControls?: SubagentControlsValue;
   /** Session-level output shown after the latest reply and before its action row. */
   latestTurnAccessory?: ReactNode;
   /** False while another tab is in front; local transcript state is retained. */
@@ -232,6 +252,8 @@ function AgentTranscriptComponent({
   onJumpToBottomReady,
   onRevealReady,
   onNavigateReady,
+  onSubagentRevealReady,
+  subagentControls = NO_SUBAGENT_CONTROLS,
   latestTurnAccessory,
 
   visible = true,
@@ -645,7 +667,56 @@ function AgentTranscriptComponent({
     };
   }, [visible, searchQuery, searchCurrent, visibleTurnCount, openWork]);
 
-  return (
+  const [subagentReveal, setSubagentReveal] = useState<{
+    id: string;
+    nonce: number;
+  } | null>(null);
+  const revealSubagent = useCallback(
+    (blockId: string): boolean => {
+      const turn = turnsRef.current.find((item) =>
+        item.some((block) => block.id === blockId),
+      );
+      if (!turn || !revealBlock(blockId)) return false;
+      const turnId = turn[0].id;
+      // A run that settled sits in its turn's folded work; open that first,
+      // then the row itself (SubagentRow listens for this id).
+      flushSync(() => {
+        setOpenWork((current) =>
+          current[turnId] ? current : { ...current, [turnId]: true },
+        );
+        setSubagentReveal((current) => ({
+          id: blockId,
+          nonce: (current?.nonce ?? 0) + 1,
+        }));
+      });
+      const el = scroller.current;
+      if (!el) return false;
+      // Leave the live tail the way a reader scrolling up does, or the next
+      // streamed line pulls the view back to the bottom.
+      el.dispatchEvent(new WheelEvent("wheel", { deltaY: -1 }));
+      const align = () => {
+        const target = el.querySelector<HTMLElement>(
+          `[data-subagent-row="${CSS.escape(blockId)}"]`,
+        );
+        if (!target) return;
+        const delta =
+          target.getBoundingClientRect().top -
+          el.getBoundingClientRect().top -
+          42;
+        if (Math.abs(delta) > 2) el.scrollTop += delta;
+      };
+      align();
+      requestAnimationFrame(align);
+      return true;
+    },
+    [revealBlock],
+  );
+
+  useEffect(() => {
+    onSubagentRevealReady?.(revealSubagent);
+  }, [revealSubagent, onSubagentRevealReady]);
+
+  const transcript = (
     <div
       ref={setScroller}
       className="agent-transcript h-full overflow-y-auto overscroll-none [overflow-anchor:none] font-mono text-[13px] leading-5"
@@ -982,6 +1053,14 @@ function AgentTranscriptComponent({
         />
       ) : null}
     </div>
+  );
+
+  return (
+    <SubagentControls.Provider value={subagentControls}>
+      <SubagentReveal.Provider value={subagentReveal}>
+        {transcript}
+      </SubagentReveal.Provider>
+    </SubagentControls.Provider>
   );
 }
 
@@ -2464,6 +2543,12 @@ function SubagentStack({
 }) {
   return (
     <div className={`flex min-w-0 flex-col ${embedded ? "" : "px-4"}`}>
+      {/* Several runs at once get one line saying where they all stand. */}
+      {blocks.length > 1 ? (
+        <div className="pb-0.5 font-sans text-[12px] text-content/40">
+          {subagentTallyLine(subagentTally(blocks))}
+        </div>
+      ) : null}
       {blocks.map((block) => (
         <SubagentRow
           key={block.id}
@@ -2499,7 +2584,13 @@ function SubagentRow({
   onOpenDiff?: (path: string) => void;
 }) {
   const [override, setOverride] = useState<boolean | null>(null);
-  const open = override ?? toolCallState(block) === "rejected";
+  const open = override ?? subagentRunState(block) === "failed";
+  // A sidebar click lands here: open onto the run's trail, once per click.
+  const reveal = useContext(SubagentReveal);
+  const revealed = reveal?.id === block.id ? reveal.nonce : null;
+  useEffect(() => {
+    if (revealed != null) setOverride(true);
+  }, [revealed]);
   return (
     <SubagentPanel
       block={block}
@@ -2548,7 +2639,20 @@ function SubagentPanel({
   const stepBlocks = useMemo(() => steps.map(agentStepBlock), [steps]);
   const status = subagentStatusLine(block, steps);
   const report = subagentReport(block);
-  const failed = state === "rejected";
+  const failed = subagentRunState(block) === "failed";
+  // Only a running row ticks; a settled one shows the time it recorded.
+  const now = useNow(active);
+  const elapsed = formatElapsed(subagentElapsed(block, now));
+  const { stop } = useContext(SubagentControls);
+  const callId = block.tool?.callId;
+  const [stopping, setStopping] = useState(false);
+  // Claude confirms a stop by ending the task. If that never comes, give the
+  // button back rather than leaving it spinning.
+  useEffect(() => {
+    if (!stopping) return;
+    const id = window.setTimeout(() => setStopping(false), 15_000);
+    return () => window.clearTimeout(id);
+  }, [stopping]);
 
   // The name takes the room it needs and gives the rest back: a provider that
   // names a run with its whole brief must not push the row off the pane.
@@ -2564,15 +2668,13 @@ function SubagentPanel({
       ) : (
         <span
           className={`min-w-0 flex-1 truncate font-sans text-sm transition-colors duration-200 ${
-            state === "rejected"
-              ? "text-red-400"
-              : "text-content/75 group-hover:text-content"
+            failed ? "text-red-400" : "text-content/75 group-hover:text-content"
           }`}
         >
           {name}
         </span>
       )}
-      {model || status ? (
+      {model || status || elapsed ? (
         <span className="flex min-w-0 max-w-[55%] shrink-0 items-baseline gap-2 font-sans text-[12px] text-content/40">
           {model ? (
             <span className="truncate" title={`Model: ${model}`}>
@@ -2580,50 +2682,97 @@ function SubagentPanel({
             </span>
           ) : null}
           {status ? <span className="shrink-0">{status}</span> : null}
+          {elapsed ? (
+            <span
+              className="shrink-0 tabular-nums"
+              title={active ? `Running for ${elapsed}` : `Ran for ${elapsed}`}
+            >
+              {elapsed}
+            </span>
+          ) : null}
         </span>
       ) : null}
     </span>
   );
+
+  // Stops this run alone; Claude carries on with what the others bring back.
+  // It shows with the row's hover, like the change list's row actions, and
+  // stays lit while the stop is on its way.
+  const stopButton =
+    active && stop && callId ? (
+      <button
+        type="button"
+        aria-label={`Stop ${name}`}
+        title="Stop this subagent"
+        disabled={stopping}
+        onClick={() => {
+          setStopping(true);
+          void stop(callId).then(
+            (stopped) => {
+              if (!stopped) setStopping(false);
+            },
+            () => setStopping(false),
+          );
+        }}
+        className="grid size-5 shrink-0 place-items-center rounded text-content/45 opacity-0 transition-opacity duration-150 hover:bg-content/10 hover:text-content focus-visible:opacity-100 group-hover/run:opacity-100 disabled:opacity-100"
+      >
+        {stopping ? (
+          <Loader className="size-3 animate-spin" strokeWidth={1.75} />
+        ) : (
+          <Square className="size-3" strokeWidth={2} />
+        )}
+      </button>
+    ) : null;
 
   // A run that has not reported a step yet has nothing to open into. The row
   // still holds its place, so the chevron arriving does not move anything.
   if (steps.length === 0 && !report) {
     return (
       <div
+        data-subagent-row={block.id}
         aria-label={`Subagent: ${name}`}
         title={brief}
-        className="-mx-1.5 flex min-w-0 items-center gap-2 px-1.5 py-1"
+        // Named, so only the stop button answers the hover: a row with
+        // nothing to open does not light its name up as if it could.
+        className="group/run -mx-1.5 flex min-w-0 items-center gap-2 px-1.5 py-1"
       >
         <SubagentMascot name={name} state={state} active={active} />
         {label}
         <span className="size-3.5 shrink-0" />
+        {stopButton}
       </div>
     );
   }
 
   return (
-    <div className="flex min-w-0 flex-col">
-      <button
-        type="button"
-        aria-expanded={open}
-        aria-label={open ? `Hide ${name}'s work` : `Show ${name}'s work`}
-        title={brief}
-        onClick={onToggle}
-        // An open row keeps the wash it lit up under the cursor, so the panel
-        // below reads as hanging off it rather than off the transcript.
-        className={`group -mx-1.5 flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left transition-colors duration-200 hover:bg-content/8 ${
+    <div data-subagent-row={block.id} className="flex min-w-0 flex-col">
+      {/* An open row keeps the wash it lit up under the cursor, so the panel
+          below reads as hanging off it rather than off the transcript. The
+          wash sits on the row, not the toggle, so it covers the stop button. */}
+      <div
+        className={`group group/run -mx-1.5 flex min-w-0 items-center gap-1 rounded-md px-1.5 transition-colors duration-200 hover:bg-content/8 ${
           open ? "bg-content/8" : ""
         }`}
       >
-        <SubagentMascot name={name} state={state} active={active} />
-        {label}
-        <ChevronRight
-          className={`size-3.5 shrink-0 text-content/35 transition-transform duration-200 group-hover:text-content/60 ${
-            open ? "rotate-90" : ""
-          }`}
-          strokeWidth={1.75}
-        />
-      </button>
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-label={open ? `Hide ${name}'s work` : `Show ${name}'s work`}
+          title={brief}
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-md py-1 text-left"
+        >
+          <SubagentMascot name={name} state={state} active={active} />
+          {label}
+          <ChevronRight
+            className={`size-3.5 shrink-0 text-content/35 transition-transform duration-200 group-hover:text-content/60 ${
+              open ? "rotate-90" : ""
+            }`}
+            strokeWidth={1.75}
+          />
+        </button>
+        {stopButton}
+      </div>
       <div className="zen-phase-body" data-open={open}>
         {open ? (
           /*
@@ -2725,7 +2874,8 @@ function agentStepBlock(step: AgentStep): Block {
  * the agent is working, and the count says how far it has got.
  */
 function subagentStatusLine(block: Block, steps: AgentStep[]): string {
-  if (toolCallState(block) === "rejected") return "failed";
+  const state = subagentRunState(block);
+  if (state === "failed" || state === "stopped") return state;
   const tools = steps.filter((step) => step.kind === "tool").length;
   if (tools === 0) return "";
   return tools === 1 ? "1 step" : `${tools} steps`;
@@ -3313,15 +3463,6 @@ function formatWorkingDuration(
     return who ? `${who} ${verb}…` : `${verb}…`;
   }
   return who ? `${who} ${verb} for ${elapsed}` : `${verb} for ${elapsed}`;
-}
-
-function formatElapsed(elapsedMs: number | null): string | null {
-  if (elapsedMs == null) return null;
-  const totalSec = Math.max(1, Math.round(elapsedMs / 1000));
-  if (totalSec < 60) return `${totalSec}s`;
-  const minutes = Math.floor(totalSec / 60);
-  const seconds = totalSec % 60;
-  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
 function ToolCall({

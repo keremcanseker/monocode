@@ -44,7 +44,10 @@ export function toolCallState(block: Block): ToolCallState {
     return "rejected";
   }
   if (needsApproval(block)) return "pending";
-  if (status === "completed" || status === "success") return "accepted";
+  // A run the user stopped settled on purpose: it is neither still going nor
+  // a failure to open, count or colour red. Its row says "stopped" itself.
+  if (status === "completed" || status === "success" || status === "stopped")
+    return "accepted";
   if (
     block.streaming ||
     status === "in_progress" ||
@@ -490,6 +493,123 @@ export function activityStillRunning(blocks: Block[]): boolean {
         !isHiddenTool(block) &&
         toolCallState(block) === "pending") ||
       needsApproval(block),
+  );
+}
+
+/** A delegated run the user stopped before it reported back. */
+export function isStoppedRun(block: Block): boolean {
+  return block.tool?.status?.toLowerCase() === "stopped";
+}
+
+export type SubagentRunState = "running" | "done" | "failed" | "stopped";
+
+export function subagentRunState(block: Block): SubagentRunState {
+  if (isStoppedRun(block)) return "stopped";
+  const state = toolCallState(block);
+  if (state === "pending") return "running";
+  return state === "rejected" ? "failed" : "done";
+}
+
+/** Tool steps a run has taken, the count its row shows. */
+export function subagentStepCount(block: Block): number {
+  return (block.agentRun?.steps ?? []).filter((step) => step.kind === "tool")
+    .length;
+}
+
+/**
+ * How long a run has gone on: its recorded duration once it settled, the
+ * clock since it started while it runs, nothing for runs saved before
+ * MonoCode timed them.
+ */
+export function subagentElapsed(block: Block, now: number): number | null {
+  if (block.durationMs != null) return block.durationMs;
+  if (block.startedAt == null || subagentRunState(block) !== "running")
+    return null;
+  return Math.max(0, now - block.startedAt);
+}
+
+export function formatElapsed(elapsedMs: number | null): string | null {
+  if (elapsedMs == null) return null;
+  const totalSec = Math.max(1, Math.round(elapsedMs / 1000));
+  if (totalSec < 60) return `${totalSec}s`;
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec % 60;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+export type SubagentTally = Record<SubagentRunState, number> & {
+  total: number;
+};
+
+export function subagentTally(blocks: Block[]): SubagentTally {
+  const tally: SubagentTally = {
+    total: 0,
+    running: 0,
+    done: 0,
+    failed: 0,
+    stopped: 0,
+  };
+  for (const block of blocks) {
+    if (!isSubagentBlock(block)) continue;
+    tally.total += 1;
+    tally[subagentRunState(block)] += 1;
+  }
+  return tally;
+}
+
+/** "4 subagents · 2 running · 1 done · 1 stopped", leaving out empty counts. */
+export function subagentTallyLine(tally: SubagentTally): string {
+  const parts = [
+    tally.total === 1 ? "1 subagent" : `${tally.total} subagents`,
+    ...(["running", "done", "stopped", "failed"] as const).flatMap((state) =>
+      tally[state] ? [`${tally[state]} ${state}`] : [],
+    ),
+  ];
+  return parts.join(" · ");
+}
+
+export type LiveSubagent = {
+  /** The run's transcript block, which a reveal scrolls to. */
+  blockId: string;
+  name: string;
+  brief: string;
+  state: SubagentRunState;
+  steps: number;
+  startedAt?: number;
+  durationMs?: number;
+};
+
+/**
+ * The batch of delegated runs a session is waiting on, for the sidebar: every
+ * run since the user message that preceded the oldest one still going. Empty
+ * once nothing runs, so a finished batch leaves the card as it was.
+ */
+export function liveSubagents(blocks: Block[]): LiveSubagent[] {
+  let oldestRunning = -1;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = blocks[i];
+    if (isSubagentBlock(block) && subagentRunState(block) === "running")
+      oldestRunning = i;
+  }
+  if (oldestRunning < 0) return [];
+  let start = oldestRunning;
+  while (start > 0 && blocks[start - 1].role !== "user") start -= 1;
+  return blocks.slice(start).flatMap((block): LiveSubagent[] =>
+    isSubagentBlock(block)
+      ? [
+          {
+            blockId: block.id,
+            name: subagentName(block),
+            brief: subagentBrief(block),
+            state: subagentRunState(block),
+            steps: subagentStepCount(block),
+            ...(block.startedAt != null ? { startedAt: block.startedAt } : {}),
+            ...(block.durationMs != null
+              ? { durationMs: block.durationMs }
+              : {}),
+          },
+        ]
+      : [],
   );
 }
 

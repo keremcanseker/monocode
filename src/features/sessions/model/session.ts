@@ -290,9 +290,9 @@ export type Block = {
   image?: GeneratedImageMeta;
   attachments?: Attachment[];
   streaming?: boolean;
-  /** Epoch ms when this user turn started. */
+  /** Epoch ms when this user turn, or the delegated run on an agent tool block, started. */
   startedAt?: number;
-  /** How long the agent worked on this user turn, in ms. */
+  /** How long the agent worked on this user turn, or the delegated run ran, in ms. */
   durationMs?: number;
   /** Stable model label for this turn. Present on newly created user blocks. */
   turnModel?: TurnModel;

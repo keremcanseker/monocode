@@ -42,6 +42,7 @@ const {
   respondClaudeQuestion,
   sendClaudeTurn,
   stopClaudeSession,
+  stopClaudeSubagent,
   __claudeTestReset,
 } = await import("./claude");
 import type { HarnessEvent } from "../../core/types";
@@ -815,6 +816,71 @@ describe("claude subagents", () => {
         }),
       );
     }
+  });
+
+  it("stops one subagent on request and shows it stopped, not failed", async () => {
+    const { events, turn } = await startTurn("s1");
+    emit({
+      type: "assistant",
+      session_id: "sess_1",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_docs",
+            name: "Agent",
+            input: {
+              description: "Read the local docs",
+              subagent_type: "general-purpose",
+            },
+          },
+        ],
+      },
+    });
+    emit({
+      type: "system",
+      subtype: "task_started",
+      task_id: "t1",
+      tool_use_id: "toolu_docs",
+      description: "Read the local docs",
+      task_type: "local_agent",
+      is_backgrounded: true,
+    });
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+
+    expect(await stopClaudeSubagent("s1", "toolu_unknown")).toBe(false);
+    expect(await stopClaudeSubagent("s1", "toolu_docs")).toBe(true);
+    expect(
+      parse().find(
+        (message) =>
+          (message.request as Record<string, unknown> | undefined)?.subtype ===
+          "stop_task",
+      )?.request,
+    ).toMatchObject({ subtype: "stop_task", task_id: "t1" });
+
+    // Claude ends the task as killed; the row reads stopped.
+    emit({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "t1",
+      patch: { status: "killed" },
+    });
+    emit({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "t1",
+      tool_use_id: "toolu_docs",
+      status: "killed",
+      summary: "Agent stopped",
+    });
+    emitFollowUpTurn("The docs reader was stopped.");
+    await turn;
+
+    const updates = events.filter(
+      (event) => event.type === "tool.updated" && event.callId === "toolu_docs",
+    );
+    expect(updates.at(-1)).toMatchObject({ status: "stopped" });
+    expect(updates.some((event) => event.type === "tool.updated" && event.status === "failed")).toBe(false);
   });
 
   it("does not end the turn on a subagent result", async () => {

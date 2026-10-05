@@ -3,6 +3,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -10,6 +11,11 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Composer } from "./Composer";
+import type { SubagentControlsValue } from "./subagentControls";
+import {
+  subscribeSubagentReveal,
+  takeSubagentReveal,
+} from "../model/subagentReveal";
 import type { Worktree } from "../../source-control/model/worktrees";
 import {
   orchestrationCheckoutCwd,
@@ -22,6 +28,8 @@ import { SessionReview } from "./SessionReview";
 import { PromptOutline } from "./PromptOutline";
 import {
   canCompactHarnessContext,
+  canStopHarnessSubagent,
+  stopHarnessSubagent,
   type ApprovalDecision,
   type UserQuestionReply,
 } from "../../../integrations/harness";
@@ -454,6 +462,36 @@ const LocalSessionPane = memo(function LocalSessionPane({
     (blockId: string) => revealBlockRef.current?.(blockId) ?? false,
     [],
   );
+  const subagentRevealRef = useRef<((blockId: string) => boolean) | null>(null);
+  const onSubagentRevealReady = useCallback(
+    (reveal: (blockId: string) => boolean) => {
+      subagentRevealRef.current = reveal;
+    },
+    [],
+  );
+  // A sidebar row asks for one of this session's runs. Take it only once the
+  // pane is on screen: a hidden tab has nothing to scroll.
+  useEffect(() => {
+    if (!visible) return;
+    const take = () => {
+      const reveal = subagentRevealRef.current;
+      if (!reveal) return;
+      const blockId = takeSubagentReveal(session.id);
+      if (blockId) reveal(blockId);
+    };
+    take();
+    return subscribeSubagentReveal(take);
+  }, [visible, session.id]);
+  const subagentControls = useMemo<SubagentControlsValue>(
+    () =>
+      !remote && canStopHarnessSubagent(session.harness)
+        ? {
+            stop: (callId) =>
+              stopHarnessSubagent(session.harness, session.id, callId),
+          }
+        : {},
+    [remote, session.harness, session.id],
+  );
   const navigateBlockRef = useRef<
     ((blockId: string | null, query?: string) => boolean) | null
   >(null);
@@ -874,6 +912,8 @@ const LocalSessionPane = memo(function LocalSessionPane({
                   onJumpToBottomReady={onJumpToBottomReady}
                   onRevealReady={onRevealReady}
                   onNavigateReady={onNavigateReady}
+                  onSubagentRevealReady={onSubagentRevealReady}
+                  subagentControls={subagentControls}
                   onScrollerChange={setTranscriptScroller}
                   editingLastTurn={editingLastTurn}
                   onEditLastTurn={

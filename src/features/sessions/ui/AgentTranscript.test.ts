@@ -1,8 +1,12 @@
 import { createElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Block } from "../model/session";
 import { AgentTranscript } from "./AgentTranscript";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 function tool(id: string, approval?: Block["approval"]): Block {
   return {
@@ -482,7 +486,8 @@ describe("AgentTranscript collapsed work", () => {
       true,
     );
 
-    // A row each, named, hopping while the run is live — no grouped header.
+    // A row each, named, hopping while the run is live. The line above them
+    // only counts them; it does not narrate who is working.
     expect(markup).toContain("Correctness review");
     expect(markup).toContain("Quality review");
     expect(markup).toContain("Haiku 4.5");
@@ -536,6 +541,52 @@ describe("AgentTranscript collapsed work", () => {
       "Independently review the current repository&#x27;s recent…",
     );
     expect(markup).toContain("Inspect the uncommitted diff.");
+  });
+
+  it("tallies parallel runs, times each one and offers to stop the running ones", () => {
+    vi.spyOn(Date, "now").mockReturnValue(61_000);
+    const running = (id: string, name: string): Block => ({
+      id,
+      role: "tool",
+      text: name,
+      startedAt: 1_000,
+      tool: { callId: `toolu_${id}`, kind: "agent", status: "in_progress" },
+      agentRun: { name, steps: [] },
+    });
+    const blocks: Block[] = [
+      { id: "user", role: "user", text: "Research", startedAt: 1_000 },
+      running("a1", "Read the docs"),
+      running("a2", "Scan the code"),
+      {
+        id: "a3",
+        role: "tool",
+        text: "Search forums",
+        startedAt: 1_000,
+        durationMs: 125_000,
+        tool: { callId: "toolu_a3", kind: "agent", status: "stopped" },
+        agentRun: { name: "Search forums", steps: [] },
+      },
+    ];
+    const markup = renderToStaticMarkup(
+      createElement(AgentTranscript, {
+        blocks,
+        busy: true,
+        subagentControls: { stop: async () => true },
+      }),
+    );
+
+    expect(markup).toContain("3 subagents · 2 running · 1 stopped");
+    // A running row counts from its start; a settled one keeps its time.
+    expect(markup).toContain(">1m<");
+    expect(markup).toContain("2m 5s");
+    expect(markup).toContain('aria-label="Stop Read the docs"');
+    expect(markup).toContain('aria-label="Stop Scan the code"');
+    expect(markup).not.toContain('aria-label="Stop Search forums"');
+    expect(markup).toContain(">stopped<");
+    // A run the user stopped is not a failure: no red name.
+    expect(markup).not.toContain("text-red-400");
+    // Where the harness cannot stop one run, there is no button to offer.
+    expect(render(blocks, true)).not.toContain('aria-label="Stop ');
   });
 
   it("groups an opened subagent's trail the way the main transcript does", () => {
