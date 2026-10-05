@@ -1227,12 +1227,18 @@ function handleAgentLifecycle(
   }
   for (const row of liveTasks) {
     if (live.agentTasks.has(row.taskId)) continue;
+    // The list carries no tool_use_id and often lands before task_started, so
+    // a subagent Claude just launched would get a second row under its
+    // description. Claim its Agent call instead; only a task with no call on
+    // record (one already running when this process attached) gets its own.
+    const toolUseId = unclaimedAgentCall(live, row.description);
     live.agentTasks.set(row.taskId, {
       taskId: row.taskId,
+      ...(toolUseId ? { toolUseId } : {}),
       description: row.description,
       backgrounded: true,
     });
-    upsertAgentTool(live, undefined, row.description, "in_progress");
+    upsertAgentTool(live, toolUseId, row.description, "in_progress");
   }
   maybeFinishTurn(live);
   syncBackgroundWait(live);
@@ -1383,6 +1389,24 @@ function noteSubagentResults(
       status: result.isError ? "failed" : "completed",
     });
   }
+}
+
+/** The Agent call launched with this description that no task has claimed. */
+function unclaimedAgentCall(
+  live: Live,
+  description: string,
+): string | undefined {
+  const claimed = new Set(
+    [...live.agentTasks.values()].map((task) => task.toolUseId),
+  );
+  const wanted = description.trim();
+  for (const tool of live.toolsById.values()) {
+    if (!isAgentToolName(tool.name) || claimed.has(tool.id)) continue;
+    if (stringField(tool.input, "description")?.trim() === wanted) {
+      return tool.id;
+    }
+  }
+  return undefined;
 }
 
 function isBackgroundedAgentTool(live: Live, toolUseId: string): boolean {

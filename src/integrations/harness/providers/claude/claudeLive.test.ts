@@ -744,6 +744,79 @@ describe("claude subagents", () => {
     );
   });
 
+  it("keeps one row per subagent when the task list arrives before task_started", async () => {
+    const { events, turn } = await startTurn("s1");
+    const agents = [
+      { id: "toolu_docs", task: "t1", description: "Read the local docs" },
+      { id: "toolu_code", task: "t2", description: "Scan open source code" },
+    ];
+    emit({
+      type: "assistant",
+      session_id: "sess_1",
+      message: {
+        content: agents.map((agent) => ({
+          type: "tool_use",
+          id: agent.id,
+          name: "Agent",
+          input: {
+            description: agent.description,
+            subagent_type: "general-purpose",
+          },
+        })),
+      },
+    });
+    // Claude lists the tasks before it says which Agent call each one is.
+    emit({
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: agents.map((agent) => ({
+        task_id: agent.task,
+        task_type: "local_agent",
+        description: agent.description,
+      })),
+    });
+    for (const agent of agents) {
+      emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: agent.task,
+        tool_use_id: agent.id,
+        description: agent.description,
+        task_type: "local_agent",
+        is_backgrounded: true,
+      });
+    }
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    for (const agent of agents) {
+      emit({
+        type: "system",
+        subtype: "task_notification",
+        task_id: agent.task,
+        tool_use_id: agent.id,
+        status: "completed",
+        summary: "Done",
+      });
+    }
+    emitFollowUpTurn("Both agents reported back.");
+    await turn;
+
+    const rows = events.flatMap((event) =>
+      event.type === "tool.started" && event.kind === "agent"
+        ? [event.callId]
+        : [],
+    );
+    expect(rows).toEqual(["toolu_docs", "toolu_code"]);
+    for (const agent of agents) {
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "tool.updated",
+          callId: agent.id,
+          status: "completed",
+        }),
+      );
+    }
+  });
+
   it("does not end the turn on a subagent result", async () => {
     const { events, turn } = await startTurn("s1");
     let settled = false;
