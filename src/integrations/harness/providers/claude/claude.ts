@@ -17,6 +17,7 @@ import {
   assistantTextBlocks,
   assistantThinkingBlocks,
   assistantToolUses,
+  contextFromCompactBoundary,
   contextFromResult,
   contextUsedFromAssistant,
   turnMetricsFromResult,
@@ -713,6 +714,15 @@ function handleLine(sessionId: string, live: Live, line: string): void {
     return;
   }
   if (type === "system") {
+    // Only a manual /compact needs this: an automatic one mid-turn gets a real
+    // reading a moment later, and a boundary does not say whose it is, so a
+    // subagent's own compaction would pass for this session's.
+    const compacted = live.manualCompaction
+      ? contextFromCompactBoundary(rec)
+      : undefined;
+    if (compacted !== undefined) {
+      live.onEvent({ type: "context", used: compacted });
+    }
     const text = statusTextFromSystem(rec);
     if (text) {
       if ((stringField(rec, "subtype") ?? "").startsWith("compact")) {
@@ -945,7 +955,7 @@ function settleInlineAgentTask(live: Live, toolUseId: string): void {
 function handleResult(live: Live, rec: Record<string, unknown>): void {
   if (isSubagentMessage(rec)) return;
   // A /compact result reports the summarizer call's usage, not the rebuilt
-  // conversation level. The next real turn will provide the fresh reading.
+  // conversation level. The compact boundary carried that level already.
   if (!live.manualCompaction) {
     const context = contextFromResult(rec);
     if (context) live.onEvent({ type: "context", ...context });

@@ -1127,3 +1127,22 @@ export function contextFromResult(
   if (!used && !window) return undefined;
   return { used: used > 0 ? used : undefined, window };
 }
+
+/**
+ * Context level right after Claude compacted, from the boundary it marks. A
+ * manual /compact reports nothing else until the next turn, so this is what
+ * shows the drop. It counts the summary that replaced the conversation; the
+ * next request's reading adds back the system prompt and tools.
+ */
+export function contextFromCompactBoundary(
+  rec: Record<string, unknown>,
+): number | undefined {
+  if (
+    stringField(rec, "type") !== "system" ||
+    stringField(rec, "subtype") !== "compact_boundary"
+  ) {
+    return undefined;
+  }
+  const used = numberField(asRecord(rec.compact_metadata), "post_tokens");
+  return used > 0 ? used : undefined;
+}

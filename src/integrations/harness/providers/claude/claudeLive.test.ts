@@ -1799,18 +1799,57 @@ describe("claude manual compaction", () => {
       session_id: "sess_1",
       message: { content: [{ type: "text", text: "not transcript output" }] },
     });
+    // As Claude Code 2.1.287 marks it.
     emit({
       type: "system",
       subtype: "compact_boundary",
       session_id: "sess_1",
+      compact_metadata: {
+        trigger: "manual",
+        pre_tokens: 740_285,
+        post_tokens: 18_412,
+        cumulative_dropped_tokens: 721_873,
+        duration_ms: 13_178,
+      },
     });
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    // The summarizer's own call, all zeros: not the level that is left.
+    emit({
+      type: "result",
+      subtype: "success",
+      session_id: "sess_1",
+      usage: { input_tokens: 0, output_tokens: 0, iterations: [] },
+      modelUsage: { "claude-sonnet-5": { contextWindow: 1_000_000 } },
+    });
     await compact;
 
     expect(events).toContainEqual({
       type: "status",
       text: "Compacted context",
     });
+    // The indicator drops right away, not on the next turn.
+    expect(events.filter((event) => event.type === "context")).toEqual([
+      { type: "context", used: 18_412 },
+    ]);
     expect(events.some((event) => event.type === "message.delta")).toBe(false);
+  });
+
+  it("leaves an automatic compaction's level to the reading that follows it", async () => {
+    const { events, turn } = await startTurn("s1");
+    emit({
+      type: "system",
+      subtype: "compact_boundary",
+      session_id: "sess_1",
+      compact_metadata: {
+        trigger: "auto",
+        pre_tokens: 190_000,
+        post_tokens: 6_000,
+      },
+    });
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await turn;
+
+    expect(
+      events.some((event) => event.type === "context" && event.used === 6_000),
+    ).toBe(false);
   });
 });
