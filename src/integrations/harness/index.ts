@@ -184,6 +184,8 @@ export {
   canStopHarnessSubagent,
   stopHarnessSubagent,
   forgetHarnessSession,
+  canForkHarnessSession,
+  forkHarnessSession,
   bindHarnessSession,
   refreshHarnessCatalogs,
   generateHarnessTitle,

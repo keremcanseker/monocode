@@ -11,6 +11,7 @@ import type { NativeCommandProvider } from "./nativeCommands";
 import type {
   ApprovalDecision,
   CompactContextInput,
+  ForkSessionInput,
   HarnessEvent,
   RewindLastTurnInput,
   RewindLastTurnResult,
@@ -76,6 +77,8 @@ export type HarnessAdapter = {
   stopSubagent?(sessionId: string, callId: string): Promise<boolean>;
   /** Drop resume state and kill the child (delete, harness switch, idle detach). */
   forgetSession(sessionId: string): Promise<void>;
+  /** Start a thread as a copy of another conversation, made on its first turn. */
+  forkSession?(input: ForkSessionInput): void;
   /** Seed resume state from a restored MonoCode session. */
   bindSession(
     threadId: string,
@@ -372,6 +375,21 @@ export async function forgetHarnessSession(
   const adapter = getHarness(harness);
   if (!adapter) return;
   await adapter.forgetSession(sessionId);
+}
+
+export function canForkHarnessSession(id: HarnessId): boolean {
+  const adapter = adapters.get(id);
+  return adapter?.live === true && adapter.forkSession != null;
+}
+
+export function forkHarnessSession(
+  input: ForkSessionInput & { harness: HarnessId },
+): void {
+  const adapter = requireHarness(input.harness);
+  if (!adapter.forkSession) {
+    throw new Error(`${input.harness} does not support forking a conversation`);
+  }
+  adapter.forkSession(input);
 }
 
 export function bindHarnessSession(

@@ -5,6 +5,7 @@ import {
   CircleDashed,
   Copy,
   FilePlusCorner,
+  GitFork,
   Minus,
   Pencil,
   PenLine,
@@ -69,6 +70,7 @@ import { playCue } from "../../settings/model/sounds";
 import { legacyTaskListFromText } from "../model/taskList";
 import { resolveModel } from "../model/models";
 import { harnessForTurn } from "../model/secondOpinion";
+import { forkPoint } from "../model/fork";
 import { Shimmer } from "../../../shared/ui/Shimmer";
 import {
   hasPendingApproval,
@@ -200,6 +202,8 @@ type Props = {
   planBuildTargets?: boolean;
   onSecondOpinion?: (target: ModelTarget, turn: Block[]) => void;
   onHandoff?: (target: ModelTarget, turn: Block[]) => void;
+  /** Copy the conversation through this turn into a new tab. */
+  onFork?: (turn: Block[]) => void;
   onEditLastTurn?: () => void;
   editingLastTurn?: boolean;
   onJumpToBottomChange?: (show: boolean) => void;
@@ -247,6 +251,7 @@ function AgentTranscriptComponent({
   planBuildTargets = true,
   onSecondOpinion,
   onHandoff,
+  onFork,
   onEditLastTurn,
   editingLastTurn = false,
   onJumpToBottomChange,
@@ -1054,6 +1059,11 @@ function AgentTranscriptComponent({
                   onHandoff={
                     onHandoff ? (target) => onHandoff(target, turn) : undefined
                   }
+                  onFork={
+                    onFork && forkPoint(blocks, turn)
+                      ? () => onFork(turn)
+                      : undefined
+                  }
                 />
               ) : null}
             </div>
@@ -1168,6 +1178,7 @@ function TurnDuration({
   fromModel,
   onSecondOpinion,
   onHandoff,
+  onFork,
 }: {
   elapsedMs: number | null;
   metrics?: TurnMetrics;
@@ -1183,6 +1194,7 @@ function TurnDuration({
   fromModel?: string;
   onSecondOpinion?: (target: ModelTarget) => void;
   onHandoff?: (target: ModelTarget) => void;
+  onFork?: () => void;
 }) {
   const label = formatWorkingDuration(elapsedMs, modelName, true);
   const dot = (
@@ -1207,6 +1219,20 @@ function TurnDuration({
         ) : (
           <Check className="size-3.5" strokeWidth={1.75} />
         )}
+        {onFork ? (
+          <button
+            type="button"
+            title="Fork from here"
+            aria-label="Fork from here"
+            className="rounded-md p-1 text-content/40 hover:bg-content/8 hover:text-content/70"
+            onClick={(event) => {
+              event.stopPropagation();
+              onFork();
+            }}
+          >
+            <GitFork className="size-3.5" strokeWidth={1.75} />
+          </button>
+        ) : null}
         {fromHarness && onHandoff ? (
           <HandoffButton from={fromHarness} onPick={onHandoff} />
         ) : null}

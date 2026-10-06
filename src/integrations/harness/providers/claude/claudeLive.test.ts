@@ -38,6 +38,7 @@ const {
   bindClaudeSession,
   cancelClaudeTurn,
   compactClaudeContext,
+  forkClaudeSession,
   respondClaudeApproval,
   respondClaudeQuestion,
   sendClaudeTurn,
@@ -455,6 +456,164 @@ describe("claude legacy account resume", () => {
     expect(spawned[0]).toContain("--session-id");
     emit({ type: "result", subtype: "success", session_id: "sess_1" });
     await turn;
+  });
+});
+
+describe("claude forks", () => {
+  it("copies the source conversation on the first turn, cut where it was forked", async () => {
+    forkClaudeSession({
+      threadId: "s1",
+      providerSessionId: "sess_src",
+      providerTurnId: "entry_3",
+      cwd: "/repo",
+    });
+    const first = await startTurn("s1");
+    expect(spawned[0]).toEqual(
+      expect.arrayContaining([
+        "--resume",
+        "sess_src",
+        "--fork-session",
+        "--resume-session-at",
+        "entry_3",
+        "--session-id",
+      ]),
+    );
+    // Nothing is bound to the copy before Claude has written it.
+    expect(
+      first.events.some((event) => event.type === "session.providerBound"),
+    ).toBe(false);
+    emit({
+      type: "assistant",
+      uuid: "entry_9",
+      session_id: "sess_1",
+      message: { content: [{ type: "text", text: "Picking up from there." }] },
+    });
+    expect(first.events).toContainEqual({
+      type: "session.providerBound",
+      providerSessionId: "sess_1",
+    });
+    emit({
+      type: "assistant",
+      uuid: "sub_entry",
+      session_id: "sess_1",
+      parent_tool_use_id: "toolu_agent",
+      message: { content: [{ type: "text", text: "subagent note" }] },
+    });
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await first.turn;
+    expect(first.events).toContainEqual({
+      type: "turn.anchored",
+      providerTurnId: "entry_9",
+    });
+
+    // Once Claude has answered in the copy, it is an ordinary conversation.
+    await stopClaudeSession("s1");
+    const prompts = parse().filter((message) => message.type === "user").length;
+    const second = sendClaudeTurn({
+      sessionId: "s1",
+      cwd: "/repo",
+      model: "claude:claude-sonnet-5",
+      runtimeMode: "supervised",
+      text: "and then?",
+      attachments: [],
+      onEvent: () => undefined,
+    });
+    await waitFor(() => spawned.length === 2, "second Claude process");
+    expect(spawned[1]).toEqual(expect.arrayContaining(["--resume", "sess_1"]));
+    expect(spawned[1]).not.toContain("--fork-session");
+    emit({ type: "system", subtype: "init", session_id: "sess_1" });
+    await waitFor(
+      () =>
+        parse().filter((message) => message.type === "user").length > prompts,
+      "follow-up prompt",
+    );
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await second;
+  });
+
+  it("makes the copy again when the first turn fails before Claude answers", async () => {
+    forkClaudeSession({
+      threadId: "s1",
+      providerSessionId: "sess_src",
+      cwd: "/repo",
+    });
+    const first = await startTurn("s1");
+    expect(spawned[0]).not.toContain("--resume-session-at");
+    emit({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      session_id: "sess_1",
+    });
+    await first.turn;
+    onExit?.(1);
+    expect(
+      first.events.some((event) => event.type === "session.providerBound"),
+    ).toBe(false);
+
+    const prompts = parse().filter((message) => message.type === "user").length;
+    const retry = sendClaudeTurn({
+      sessionId: "s1",
+      cwd: "/repo",
+      model: "claude:claude-sonnet-5",
+      runtimeMode: "supervised",
+      text: "explore the codebase",
+      attachments: [],
+      onEvent: () => undefined,
+    });
+    await waitFor(() => spawned.length === 2, "second Claude process");
+    expect(spawned[1]).toEqual(
+      expect.arrayContaining(["--resume", "sess_src", "--fork-session"]),
+    );
+    emit({
+      type: "control_response",
+      response: { subtype: "success", request_id: "monocode_1" },
+    });
+    await waitFor(
+      () =>
+        parse().filter((message) => message.type === "user").length > prompts,
+      "retried prompt",
+    );
+    onExit?.(1);
+    await expect(retry).rejects.toThrow("Claude Code exited");
+  });
+
+  it("keeps a fork waiting across a restart", async () => {
+    const saved = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => saved.get(key) ?? null,
+      setItem: (key: string, value: string) => void saved.set(key, value),
+    });
+    try {
+      forkClaudeSession({
+        threadId: "s1",
+        providerSessionId: "sess_src",
+        providerTurnId: "entry_3",
+        cwd: "/repo",
+      });
+      __claudeTestReset();
+      const { turn } = await startTurn("s1");
+      expect(spawned[0]).toEqual(
+        expect.arrayContaining([
+          "--resume",
+          "sess_src",
+          "--fork-session",
+          "--resume-session-at",
+          "entry_3",
+        ]),
+      );
+      emit({
+        type: "assistant",
+        uuid: "entry_9",
+        session_id: "sess_1",
+        message: { content: [{ type: "text", text: "Picking up." }] },
+      });
+      expect(JSON.parse(saved.get("monocode.claude.forks") ?? "")).toEqual({});
+      emit({ type: "result", subtype: "success", session_id: "sess_1" });
+      await turn;
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

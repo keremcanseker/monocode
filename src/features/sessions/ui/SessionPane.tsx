@@ -84,6 +84,7 @@ import { AstraWelcome } from "./AstraWelcome";
 import { OpusWelcome } from "./OpusWelcome";
 import { projectKey } from "../../../shared/lib/paths";
 import { canEditLastTurn, lastTurnRecall } from "../model/editLastTurn";
+import { canForkSession } from "../model/fork";
 import {
   loadProjectChatBackgroundSettings,
   projectChatBackgroundImageRevision,
@@ -198,6 +199,7 @@ export type SessionPaneProps = {
     turn: Block[],
   ) => void;
   onHandoff?: (sessionId: string, target: ModelTarget, turn: Block[]) => void;
+  onFork?: (sessionId: string, turn?: Block[]) => void;
   onBtwSubmit?: (
     sessionId: string,
     turn: Block[],
@@ -309,6 +311,7 @@ const LocalSessionPane = memo(function LocalSessionPane({
   onBuildPlan,
   onSecondOpinion,
   onHandoff,
+  onFork,
   onBtwSubmit,
   onBtwRetry,
   onBtwDelete,
@@ -575,6 +578,7 @@ const LocalSessionPane = memo(function LocalSessionPane({
     return () => window.removeEventListener(ADD_TO_CHAT_EVENT, onAdd);
   }, [addSelectionToChat, addToChatTarget]);
   const workCwd = sessionWorkCwd(session);
+  const forkable = !!onFork && canForkSession(session);
   const showDeckProjectPicker = isEmpty && !looksLikeProject(session.cwd);
   const dockComposer =
     remoteSessionLoading ||
@@ -687,6 +691,7 @@ const LocalSessionPane = memo(function LocalSessionPane({
       onBtwCommand={btw.openWith}
       onStop={() => onStop(session.id)}
       onCompactContext={() => onCompactContext(session.id)}
+      onFork={forkable ? () => onFork?.(session.id) : undefined}
       onPlaceInFolder={(target) => onPlaceSessionInFolder(session.id, target)}
       queuedMessages={session.queuedMessages}
       queueStatus={session.queueStatus}
@@ -907,6 +912,9 @@ const LocalSessionPane = memo(function LocalSessionPane({
                     !session.inboxAsk && !session.worktreeRemoved && onHandoff
                       ? (target, turn) => onHandoff(session.id, target, turn)
                       : undefined
+                  }
+                  onFork={
+                    forkable ? (turn) => onFork?.(session.id, turn) : undefined
                   }
                   onJumpToBottomChange={setShowJumpToBottom}
                   onJumpToBottomReady={onJumpToBottomReady}

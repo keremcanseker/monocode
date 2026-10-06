@@ -50,6 +50,7 @@ import FolderTreeIcon from "@hugeicons/core-free-icons/FolderTreeIcon";
 import GaugeIcon from "@hugeicons/core-free-icons/GaugeIcon";
 import GitBranchIcon from "@hugeicons/core-free-icons/GitBranchIcon";
 import GitCompareIcon from "@hugeicons/core-free-icons/GitCompareIcon";
+import GitForkIcon from "@hugeicons/core-free-icons/GitForkIcon";
 import GitMergeIcon from "@hugeicons/core-free-icons/GitMergeIcon";
 import GitPullRequestClosedIcon from "@hugeicons/core-free-icons/GitPullRequestClosedIcon";
 import GitPullRequestDraftIcon from "@hugeicons/core-free-icons/GitPullRequestDraftIcon";
@@ -202,6 +203,7 @@ export const ChartBreakoutSquare = wrap(
 );
 export const GitBranch = wrap(GitBranchIcon, "GitBranch");
 export const GitCompare = wrap(GitCompareIcon, "GitCompare");
+export const GitFork = wrap(GitForkIcon, "GitFork");
 export const GitMerge = wrap(GitMergeIcon, "GitMerge");
 export const GitPullRequest = wrap(GitPullRequestIcon, "GitPullRequest");
 export const GitPullRequestClosed = wrap(

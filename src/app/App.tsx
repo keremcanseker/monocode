@@ -236,6 +236,7 @@ import {
   compactHarnessContext,
   rewindHarnessLastTurn,
   forgetHarnessSession,
+  forkHarnessSession,
   generateHarnessTitle,
   generateHarnessBranchName,
   isLiveHarness,
@@ -279,6 +280,11 @@ import {
   userMessagesAfterHandoff,
   wrapHandoffPrompt,
 } from "../features/sessions/model/handoff";
+import {
+  canForkSession,
+  forkPoint,
+  forkedSession,
+} from "../features/sessions/model/fork";
 import { requestOutgoingHandoff } from "../features/sessions/model/handoffTurn";
 import {
   applyBtwHarnessEvent,
@@ -858,6 +864,7 @@ function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
       tab.project === other.project &&
       tab.title === other.title &&
       tab.sessionCount === other.sessionCount &&
+      tab.forkSessionId === other.forkSessionId &&
       tab.dirty === other.dirty &&
       tab.more.join("\u0000") === other.more.join("\u0000") &&
       tab.harnesses.join("\u0000") === other.harnesses.join("\u0000") &&
@@ -8415,6 +8422,38 @@ export default function App({
     [openSessionBeside],
   );
 
+  /** Copy a conversation into a new tab, through `turn` or all of it. */
+  const onForkSession = useCallback(
+    async (sourceId: string, turn?: Block[]) => {
+      const source = await ensureOpenSession(sourceId);
+      const providerSessionId = source?.providerSessionId;
+      if (!source || !providerSessionId || !canForkSession(source)) return;
+      const point = turn ? forkPoint(source.blocks, turn) : {};
+      if (!point) return;
+      const session = forkedSession(
+        source,
+        point.providerTurnId ? turn : undefined,
+      );
+      forkHarnessSession({
+        harness: source.harness,
+        threadId: session.id,
+        providerSessionId,
+        cwd: sessionWorkCwd(source),
+        providerAccountId: source.providerAccountId,
+        providerTurnId: point.providerTurnId,
+      });
+      const nextSessions = [...sessionsRef.current, session];
+      sessionsRef.current = nextSessions;
+      setSessions(nextSessions);
+      const tab = newTab(session.id);
+      appendTab(tab, source.cwd);
+      setActiveTabId(tab.id);
+      setProjectTerminalFocused(false);
+      setComposerFocused(true);
+    },
+    [appendTab, ensureOpenSession],
+  );
+
   const autoContinueKey = sessions
     .filter(
       (session) => canAutoContinue(session) && isLiveHarness(session.harness),
@@ -10527,6 +10566,7 @@ export default function App({
     onBuildPlan,
     onSecondOpinion,
     onHandoff,
+    onFork: onForkSession,
     onBtwSubmit,
     onBtwRetry,
     onBtwDelete,
@@ -10568,6 +10608,7 @@ export default function App({
       onCloseMany={onCloseTabs}
       onArchiveTab={onArchiveTitleTab}
       onDeleteTab={onDeleteTitleTab}
+      onForkSession={onForkSession}
       onReorder={onReorderTabs}
       onPlaceOnPane={onPlaceTabOnPane}
       onGoToFile={onGoToFile}
@@ -10611,6 +10652,7 @@ export default function App({
               onSessionNavigationOrder={onSessionNavigationOrder}
               onPlaceSessionOnPane={onPlaceSessionOnPane}
               onRenameSession={onRenameHistorySession}
+              onForkSession={onForkSession}
               onArchiveSession={onArchiveHistorySession}
               onArchiveSessions={onArchiveHistorySessions}
               onPinSession={onPinHistorySession}
@@ -11270,6 +11312,9 @@ function toTitleTab(
     title: focused ? conversationTitle(focused) : "",
     more,
     sessionCount: tabSessions.length,
+    ...(focused && canForkSession(focused)
+      ? { forkSessionId: focused.id }
+      : {}),
     harnesses,
     busyHarnesses,
     doneHarnesses,

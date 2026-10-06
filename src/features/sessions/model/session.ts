@@ -296,7 +296,11 @@ export type Block = {
   durationMs?: number;
   /** Stable model label for this turn. Present on newly created user blocks. */
   turnModel?: TurnModel;
-  /** Provider turn boundary used to replace this user message, when known. */
+  /**
+   * Provider turn boundary, when known: the turn this message started, used to
+   * replace it (Codex), or the transcript entry its turn ended on, where a fork
+   * after the turn resumes (Claude).
+   */
   providerTurnId?: string;
   /** User turn saved to the session but not submitted to the harness yet. */
   draft?: boolean;

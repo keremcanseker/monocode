@@ -77,6 +77,7 @@ import {
 import type {
   ApprovalDecision,
   CompactContextInput,
+  ForkSessionInput,
   HarnessEvent,
   HarnessSessionInput,
   SendTurnInput,
@@ -185,10 +186,22 @@ type Live = {
   pendingAssistantBoundary: boolean;
   manualCompaction: boolean;
   compactionConfirmed: boolean;
+  /** Launched to make a fork Claude has not written yet. */
+  forking: boolean;
+  /** The main conversation's latest transcript entry: where its turn ends so far. */
+  lastEntry: string;
 };
 
 type Resume = {
   sessionId: string;
+  cwd: string;
+  providerAccountId?: string;
+};
+
+type ClaudeFork = {
+  from: string;
+  /** Last entry the copy keeps. The whole conversation when absent. */
+  at?: string;
   cwd: string;
   providerAccountId?: string;
 };
@@ -203,6 +216,47 @@ const RESUME_GRACE_MS = 15_000;
 const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
 const cancelledThreads = new Set<string>();
+
+/**
+ * Threads waiting to start as a copy of another conversation, by thread id.
+ * Claude writes the copy on the thread's first turn, so it is kept until then,
+ * across restarts too. One deleted before that turn leaves its entry behind,
+ * which nothing reads again.
+ */
+const FORKS_KEY = "monocode.claude.forks";
+let pendingForks: Map<string, ClaudeFork> | null = null;
+
+function claudeForks(): Map<string, ClaudeFork> {
+  if (pendingForks) return pendingForks;
+  pendingForks = new Map();
+  try {
+    const saved = asRecord(JSON.parse(localStorage.getItem(FORKS_KEY) ?? "{}"));
+    for (const [threadId, value] of Object.entries(saved ?? {})) {
+      const fork = asRecord(value);
+      if (stringField(fork, "from") && stringField(fork, "cwd")) {
+        pendingForks.set(threadId, fork as ClaudeFork);
+      }
+    }
+  } catch {
+    // Unavailable or unreadable: forks are kept in memory only.
+  }
+  return pendingForks;
+}
+
+function saveClaudeForks(): void {
+  try {
+    localStorage.setItem(
+      FORKS_KEY,
+      JSON.stringify(Object.fromEntries(claudeForks())),
+    );
+  } catch {
+    // private mode / quota
+  }
+}
+
+function settleClaudeFork(threadId: string): void {
+  if (claudeForks().delete(threadId)) saveClaudeForks();
+}
 
 let resolveClaudeBinaryImpl: () => Promise<{ path: string }> =
   resolveClaudeBinary;
@@ -415,6 +469,19 @@ export function bindClaudeSession(
   resumeByThread.set(threadId, { sessionId, cwd, providerAccountId });
 }
 
+export function forkClaudeSession(input: ForkSessionInput): void {
+  resumeByThread.delete(input.threadId);
+  claudeForks().set(input.threadId, {
+    from: input.providerSessionId,
+    ...(input.providerTurnId ? { at: input.providerTurnId } : {}),
+    cwd: input.cwd,
+    ...(input.providerAccountId
+      ? { providerAccountId: input.providerAccountId }
+      : {}),
+  });
+  saveClaudeForks();
+}
+
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   const settingsKey = settingsKeyFor(input);
   const planning = input.intent === "plan";
@@ -438,7 +505,19 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   }
 
   const resume = resumeByThread.get(input.sessionId);
+  // A fork stays with its folder and account, like a resume. Until Claude has
+  // answered in it there is no copy yet, whatever id an earlier try bound.
+  let fork = claudeForks().get(input.sessionId);
+  if (
+    fork &&
+    (fork.cwd !== input.cwd ||
+      !sameProviderAccountId(fork.providerAccountId, input.providerAccountId))
+  ) {
+    settleClaudeFork(input.sessionId);
+    fork = undefined;
+  }
   const canResume =
+    !fork &&
     resume != null &&
     resume.cwd === input.cwd &&
     sameProviderAccountId(resume.providerAccountId, input.providerAccountId);
@@ -456,8 +535,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     canResume && resume ? resume.sessionId : crypto.randomUUID();
   const launch = launchOptions(
     input,
-    canResume ? resume?.sessionId : undefined,
+    fork ? fork.from : canResume ? resume?.sessionId : undefined,
     claudeSessionId,
+    fork,
   );
 
   const live: Live = {
@@ -501,6 +581,8 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     pendingAssistantBoundary: false,
     manualCompaction: false,
     compactionConfirmed: false,
+    forking: fork != null,
+    lastEntry: "",
   };
   liveRef.current = live;
 
@@ -549,10 +631,13 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
       buildControlRequest(nextControlId(live), { subtype: "initialize" }),
     );
     await waitForInit(live, INIT_TIMEOUT_MS);
-    live.onEvent({
-      type: "session.providerBound",
-      providerSessionId: live.claudeSessionId,
-    });
+    // A fork has nothing to bind until Claude has answered in it.
+    if (!live.forking) {
+      live.onEvent({
+        type: "session.providerBound",
+        providerSessionId: live.claudeSessionId,
+      });
+    }
     live.onEvent({ type: "session.started" });
     return live;
   } catch (error) {
@@ -585,6 +670,8 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   live.backgroundKey = "";
   live.taskNotes = [];
   live.turnResultSeen = false;
+  // A turn that records nothing does not end where the last one did.
+  live.lastEntry = "";
 
   const turnPromise = new Promise<void>((resolve, reject) => {
     live.turnDone = resolve;
@@ -662,9 +749,26 @@ function handleLine(sessionId: string, live: Live, line: string): void {
       cwd: live.cwd,
       providerAccountId: live.providerAccountId,
     });
+    if (!live.forking) {
+      live.onEvent({
+        type: "session.providerBound",
+        providerSessionId: sessionIdFromLine,
+      });
+    }
+  }
+
+  // Claude has written the copy once it answers, so later launches resume it.
+  // A first turn stopped before that is made again from the source.
+  if (
+    live.forking &&
+    !isSubagentMessage(rec) &&
+    (type === "assistant" || (type === "result" && rec.is_error !== true))
+  ) {
+    live.forking = false;
+    settleClaudeFork(sessionId);
     live.onEvent({
       type: "session.providerBound",
-      providerSessionId: sessionIdFromLine,
+      providerSessionId: live.claudeSessionId,
     });
   }
 
@@ -684,6 +788,10 @@ function handleLine(sessionId: string, live: Live, line: string): void {
 
   if (live.manualCompaction && type !== "system" && type !== "result") {
     return;
+  }
+
+  if ((type === "assistant" || type === "user") && !isSubagentMessage(rec)) {
+    live.lastEntry = stringField(rec, "uuid") ?? live.lastEntry;
   }
 
   if (handleAgentLifecycle(live, rec)) return;
@@ -962,6 +1070,9 @@ function handleResult(live: Live, rec: Record<string, unknown>): void {
   }
   const metrics = turnMetricsFromResult(rec);
   if (metrics) live.onEvent({ type: "turn.metrics", ...metrics });
+  if (live.lastEntry) {
+    live.onEvent({ type: "turn.anchored", providerTurnId: live.lastEntry });
+  }
 
   const result = turnStatusFromResult(rec);
   if (result.status === "failed" && result.error && !live.cancelled) {
@@ -1860,11 +1971,14 @@ function launchOptions(
   input: HarnessSessionInput,
   resume: string | undefined,
   sessionId: string,
+  fork?: Pick<ClaudeFork, "at">,
 ): {
   model?: string;
   effort?: string;
   permissionMode?: ReturnType<typeof runtimeModeToPermission>;
   resume?: string;
+  forkSession?: boolean;
+  resumeAt?: string;
   sessionId?: string;
   settings?: ClaudeCliSettings;
 } {
@@ -1892,7 +2006,8 @@ function launchOptions(
         ? "plan"
         : runtimeModeToPermission(input.runtimeMode),
     resume,
-    sessionId: resume ? undefined : sessionId,
+    ...(fork ? { forkSession: true, resumeAt: fork.at } : {}),
+    sessionId: resume && !fork ? undefined : sessionId,
     settings: Object.keys(settings).length > 0 ? settings : undefined,
   };
 }
@@ -1902,4 +2017,5 @@ export function __claudeTestReset(): void {
   liveByThread.clear();
   resumeByThread.clear();
   cancelledThreads.clear();
+  pendingForks = null;
 }

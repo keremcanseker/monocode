@@ -57,6 +57,7 @@ import { copyText } from "../../platform/tauri/clipboard";
 import { resolveModel } from "../../features/sessions/model/models";
 import type { OpenFileFn } from "../../features/search/model/search";
 import { sessionDisplayTitle } from "../../features/sessions/model/session";
+import { canForkSession } from "../../features/sessions/model/fork";
 import { nextUnseenFinishedSessions } from "../../features/sessions/model/sessionDone";
 import { orchestrationTaskLabel } from "../../features/orchestration/model/orchestrationSummary";
 import {
@@ -240,6 +241,8 @@ type Props = {
     edge: PaneEdge,
   ) => void;
   onRenameSession?: (sessionId: string, title: string) => void;
+  /** Copy a conversation into a new tab. */
+  onForkSession?: (sessionId: string) => void;
   onArchiveSession?: (sessionId: string, archived: boolean) => void;
   onArchiveSessions?: (
     sessionIds: readonly string[],
@@ -347,6 +350,7 @@ function SidebarComponent({
   onPrefetchSession: onPrefetchLocalSession,
   onPlaceSessionOnPane: onPlaceLocalSessionOnPane,
   onRenameSession: onRenameLocalSession,
+  onForkSession: onForkLocalSession,
   onArchiveSession: onArchiveLocalSession,
   onArchiveSessions: onArchiveLocalSessions,
   onPinSession: onPinLocalSession,
@@ -470,6 +474,7 @@ function SidebarComponent({
   const onRenameSession = remoteProject
     ? (sessionId: string, title: string) => { void remoteChange(sessionId, { title }); }
     : onRenameLocalSession;
+  const onForkSession = remoteProject ? undefined : onForkLocalSession;
   const onArchiveSession = remoteProject
     ? (sessionId: string, archived: boolean) => { void remoteChange(sessionId, { archived }); }
     : onArchiveLocalSession;
@@ -1090,6 +1095,15 @@ function SidebarComponent({
           },
         ]
       : []),
+    ...(!multipleMenuSessions &&
+    onForkSession &&
+    menuSessions[0] &&
+    canForkSession({
+      ...menuSessions[0],
+      busy: listedBusySessionIds.has(menuSessions[0].id),
+    })
+      ? [{ kind: "item" as const, id: "fork", label: "Fork" }]
+      : []),
     ...(!multipleMenuSessions
       ? [
           {
@@ -1249,6 +1263,10 @@ function SidebarComponent({
     }
     if (id === "rename") {
       setRenamingSessionId(sessionId);
+      return;
+    }
+    if (id === "fork") {
+      onForkSession?.(sessionId);
       return;
     }
     if (id === "copy-harness-session-id" || id === "copy-monocode-session-id") {

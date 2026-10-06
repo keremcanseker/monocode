@@ -162,12 +162,31 @@ export function applyHarnessEvent(
         text: event.message,
         notice: "error",
       });
-    case "session.providerBound":
-      return { ...session, providerSessionId: event.providerSessionId };
-    case "turn.started": {
+    case "session.providerBound": {
+      if (session.providerSessionId === event.providerSessionId) return session;
+      // Turn boundaries from the conversation this one replaces mean nothing
+      // here: resuming or forking at one would fail.
+      const replaced = session.providerSessionId != null;
+      return {
+        ...session,
+        providerSessionId: event.providerSessionId,
+        ...(replaced
+          ? {
+              blocks: session.blocks.map((block) => {
+                if (!block.providerTurnId) return block;
+                const { providerTurnId: _replaced, ...rest } = block;
+                return rest;
+              }),
+            }
+          : {}),
+      };
+    }
+    case "turn.started":
+    case "turn.anchored": {
+      // A draft saved while the turn ran is not the turn it reports on.
       const index = lastMatchingBlock(
         session.blocks,
-        (block) => block.role === "user",
+        (block) => block.role === "user" && !block.draft,
       );
       if (index < 0) return session;
       const block = session.blocks[index];

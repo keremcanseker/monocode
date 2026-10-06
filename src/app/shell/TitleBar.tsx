@@ -57,6 +57,8 @@ export type Tab = {
   /** Other conversation titles in this tab, focused session omitted. */
   more: string[];
   sessionCount: number;
+  /** Focused conversation, when it can be forked. */
+  forkSessionId?: string;
   harnesses: HarnessId[];
   /** Harnesses with an in-flight turn in this tab. */
   busyHarnesses: HarnessId[];
@@ -101,6 +103,7 @@ type Props = {
   onCloseMany: (ids: string[], fallbackId: string) => void;
   onArchiveTab?: (id: string) => void;
   onDeleteTab?: (id: string) => void;
+  onForkSession?: (sessionId: string) => void;
   onReorder: (ids: string[], movedId?: string) => void;
   onPlaceOnPane?: (tabId: string, targetId: string, edge: PaneEdge) => void;
   onGoToFile?: () => void;
@@ -620,6 +623,7 @@ function TitleBarComponent({
   onCloseMany,
   onArchiveTab,
   onDeleteTab,
+  onForkSession,
   onReorder,
   onPlaceOnPane,
   onGoToFile,
@@ -783,6 +787,20 @@ function TitleBarComponent({
           label: "Close Tabs to the Left",
           disabled: contextCloseIds?.left.length === 0,
         },
+        ...(contextTab.forkSessionId && onForkSession
+          ? [
+              { kind: "sep" as const },
+              {
+                kind: "item" as const,
+                id: "fork",
+                label: "Fork",
+                description:
+                  contextTab.sessionCount > 1
+                    ? "The focused conversation, into a new tab"
+                    : undefined,
+              },
+            ]
+          : []),
         ...(contextTab.sessionCount > 0 && (onArchiveTab || onDeleteTab)
           ? [
               { kind: "sep" as const },
@@ -831,6 +849,10 @@ function TitleBarComponent({
     }
     if (id === "delete") {
       onDeleteTab?.(contextTab.id);
+      return;
+    }
+    if (id === "fork") {
+      if (contextTab.forkSessionId) onForkSession?.(contextTab.forkSessionId);
       return;
     }
     if (id === "others" || id === "right" || id === "left") {

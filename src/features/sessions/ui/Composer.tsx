@@ -6,6 +6,7 @@ import {
   CornerDownRight,
   CursorMagicSelection,
   FilePlus,
+  GitFork,
   ListEnd,
   Pause,
   Pencil,
@@ -258,6 +259,8 @@ type Props = {
   onSaveDraft?: (text: string, attachments: Attachment[]) => boolean | void;
   onStop?: () => void;
   onCompactContext?: () => boolean;
+  /** Copy this conversation into a new tab. */
+  onFork?: () => void;
   onPlaceInFolder?: (target: SessionFolderTarget) => void;
   onDeleteQueuedMessage?: (messageId: string) => void;
   onEditQueuedMessage?: (messageId: string, text: string) => void;
@@ -539,6 +542,7 @@ export function Composer({
   onSaveDraft,
   onStop,
   onCompactContext,
+  onFork,
   onPlaceInFolder,
   onDeleteQueuedMessage,
   onEditQueuedMessage,
@@ -2017,7 +2021,18 @@ export function Composer({
                   />
                 </>
               )}
-              <div className="ml-auto flex shrink-0 items-center">
+              <div className="ml-auto flex shrink-0 items-center gap-3">
+                {onFork ? (
+                  <button
+                    type="button"
+                    title="Fork conversation"
+                    aria-label="Fork conversation into a new tab"
+                    onClick={onFork}
+                    className="-m-1 grid rounded-sm p-1 text-content/45 outline-none hover:text-content/80 focus-visible:ring-1 focus-visible:ring-accent"
+                  >
+                    <GitFork className="size-3.5" strokeWidth={1.75} />
+                  </button>
+                ) : null}
                 <ContextMeter
                   usage={context}
                   onCompact={

@@ -16,6 +16,8 @@ export type HarnessEvent =
   | { type: "session.error"; message: string }
   | { type: "session.providerBound"; providerSessionId: string }
   | { type: "turn.started"; providerTurnId: string }
+  /** Where the provider's record of the latest user turn now ends. */
+  | { type: "turn.anchored"; providerTurnId: string }
   | {
       type: "session.configChanged";
       model?: string;
@@ -192,6 +194,17 @@ export type RewindLastTurnInput = CompactContextInput & {
   /** When set, Cursor may resend via session/edit_prompt in one RPC. */
   text?: string;
   attachments?: Attachment[];
+};
+
+export type ForkSessionInput = {
+  /** MonoCode thread that starts out as the copy. */
+  threadId: string;
+  /** Provider conversation it copies. */
+  providerSessionId: string;
+  cwd: string;
+  providerAccountId?: string;
+  /** Turn boundary to cut the copy at. The whole conversation when absent. */
+  providerTurnId?: string;
 };
 
 export type RewindLastTurnResult = {

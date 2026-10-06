@@ -241,6 +241,10 @@ export function buildClaudeSpawnArgs(input: {
   effort?: string;
   permissionMode?: ClaudePermissionMode;
   resume?: string;
+  /** Copy the resumed conversation into `sessionId` instead of continuing it. */
+  forkSession?: boolean;
+  /** Last transcript entry the resumed conversation keeps. */
+  resumeAt?: string;
   sessionId?: string;
   settings?: ClaudeCliSettings;
   includePartialMessages?: boolean;
@@ -285,6 +289,8 @@ export function buildClaudeSpawnArgs(input: {
     args.push("--allow-dangerously-skip-permissions");
   }
   if (input.resume) args.push("--resume", input.resume);
+  if (input.forkSession) args.push("--fork-session");
+  if (input.resumeAt) args.push("--resume-session-at", input.resumeAt);
   if (input.sessionId) args.push("--session-id", input.sessionId);
   if (input.maxTurns) args.push("--max-turns", String(input.maxTurns));
   return args;

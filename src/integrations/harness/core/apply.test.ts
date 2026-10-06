@@ -49,6 +49,49 @@ describe("background work", () => {
   });
 });
 
+describe("turn boundaries", () => {
+  it("records where a turn ended on its message, not on a later draft", () => {
+    let session = appendUser(newSession("claude", "/tmp"), "hi");
+    session = {
+      ...session,
+      blocks: [
+        ...session.blocks,
+        { id: "draft", role: "user", text: "later", draft: true },
+      ],
+    };
+    session = applyHarnessEvent(session, {
+      type: "turn.anchored",
+      providerTurnId: "entry_1",
+    });
+    expect(session.blocks[0].providerTurnId).toBe("entry_1");
+    expect(session.blocks[1].providerTurnId).toBeUndefined();
+  });
+
+  it("drops the boundaries of a conversation the provider replaced", () => {
+    let session = appendUser(newSession("claude", "/tmp"), "hi");
+    session = applyHarnessEvent(session, {
+      type: "session.providerBound",
+      providerSessionId: "sess_1",
+    });
+    session = applyHarnessEvent(session, {
+      type: "turn.anchored",
+      providerTurnId: "entry_1",
+    });
+    const same = applyHarnessEvent(session, {
+      type: "session.providerBound",
+      providerSessionId: "sess_1",
+    });
+    expect(same.blocks[0].providerTurnId).toBe("entry_1");
+
+    const replaced = applyHarnessEvent(session, {
+      type: "session.providerBound",
+      providerSessionId: "sess_2",
+    });
+    expect(replaced.providerSessionId).toBe("sess_2");
+    expect(replaced.blocks[0].providerTurnId).toBeUndefined();
+  });
+});
+
 describe("turn duration", () => {
   it("records the selected provider and model on a user turn", () => {
     const session = appendUser(
