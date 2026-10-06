@@ -1098,10 +1098,7 @@ function SidebarComponent({
     ...(!multipleMenuSessions &&
     onForkSession &&
     menuSessions[0] &&
-    canForkSession({
-      ...menuSessions[0],
-      busy: listedBusySessionIds.has(menuSessions[0].id),
-    })
+    canForkSession(menuSessions[0])
       ? [{ kind: "item" as const, id: "fork", label: "Fork" }]
       : []),
     ...(!multipleMenuSessions

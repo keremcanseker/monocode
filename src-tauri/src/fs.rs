@@ -193,6 +193,53 @@ pub fn claude_shell_commands(
     provider_account_id: Option<String>,
     tool_ids: Vec<String>,
 ) -> Result<HashMap<String, String>, String> {
+    let path = claude_transcript_path(&app, &provider_session_id, provider_account_id.as_deref())?;
+    let Some(path) = path.filter(|_| !tool_ids.is_empty()) else {
+        return Ok(HashMap::new());
+    };
+    claude_shell_commands_from_file(&path, &tool_ids)
+}
+
+/// A prompt in a Claude transcript and the message before it, where a fork
+/// from that prompt cuts. `after` is absent for the conversation's first.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct ClaudePrompt {
+    text: String,
+    after: Option<String>,
+}
+
+/// Where a Claude conversation can be forked, read from its transcript.
+#[derive(Serialize, Debug, PartialEq, Eq, Default)]
+pub struct ClaudeForkPoints {
+    /// The main conversation's prompts, oldest first.
+    prompts: Vec<ClaudePrompt>,
+    /// Its latest message, where a fork of all of it cuts.
+    last: Option<String>,
+}
+
+/// Fork points of a Claude conversation, so a fork keeps exactly what the
+/// user saw, including turns MonoCode never recorded the end of.
+#[tauri::command(async)]
+pub fn claude_fork_points(
+    app: AppHandle,
+    provider_session_id: String,
+    provider_account_id: Option<String>,
+) -> Result<ClaudeForkPoints, String> {
+    let Some(path) =
+        claude_transcript_path(&app, &provider_session_id, provider_account_id.as_deref())?
+    else {
+        return Ok(ClaudeForkPoints::default());
+    };
+    claude_fork_points_from_file(&path)
+}
+
+/// Claude keeps a session's transcript under its account's config dir, in the
+/// folder of the project it ran in.
+fn claude_transcript_path(
+    app: &AppHandle,
+    provider_session_id: &str,
+    provider_account_id: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
     if provider_session_id.is_empty()
         || !provider_session_id
             .bytes()
@@ -200,11 +247,8 @@ pub fn claude_shell_commands(
     {
         return Err("Invalid Claude provider session id".into());
     }
-    if tool_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let config_dir = match provider_account_id.as_deref() {
-        Some(id) if id != "default" => crate::harness::provider_account_path(&app, "claude", id)?,
+    let config_dir = match provider_account_id {
+        Some(id) if id != "default" => crate::harness::provider_account_path(app, "claude", id)?,
         _ => match std::env::var_os("CLAUDE_CONFIG_DIR") {
             Some(path) => PathBuf::from(path),
             None => {
@@ -214,15 +258,114 @@ pub fn claude_shell_commands(
     };
     let transcript_name = format!("{provider_session_id}.jsonl");
     let root = config_dir.join("projects");
-    let Some(path) = std::fs::read_dir(root).ok().and_then(|projects| {
+    Ok(std::fs::read_dir(root).ok().and_then(|projects| {
         projects.flatten().find_map(|project| {
             let candidate = project.path().join(&transcript_name);
             candidate.is_file().then_some(candidate)
         })
-    }) else {
-        return Ok(HashMap::new());
-    };
-    claude_shell_commands_from_file(&path, &tool_ids)
+    }))
+}
+
+fn claude_fork_points_from_file(path: &Path) -> Result<ClaudeForkPoints, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    // Every entry's parent, and whether it is a message, to step back over
+    // the attachments and system rows between a prompt and the message before.
+    let mut entries: HashMap<String, (bool, Option<String>)> = HashMap::new();
+    let mut prompts: Vec<(String, Option<String>)> = Vec::new();
+    let mut last = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(uuid) = record.get("uuid").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let kind = record.get("type").and_then(serde_json::Value::as_str);
+        let parent = record
+            .get("parentUuid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let message = matches!(kind, Some("user" | "assistant"));
+        entries.insert(uuid.to_owned(), (message, parent.clone()));
+        let flagged =
+            |key: &str| record.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+        let field = |pointer: &str| record.pointer(pointer).and_then(serde_json::Value::as_str);
+        if flagged("isSidechain") {
+            continue;
+        }
+        if message {
+            last = Some(uuid.to_owned());
+        }
+        let text = match kind {
+            Some("user") if !flagged("isMeta") && !flagged("isCompactSummary") => {
+                claude_prompt_text(record.pointer("/message/content"))
+            }
+            // A message sent while Claude works waits in a queue and is
+            // recorded where Claude takes it in.
+            Some("attachment")
+                if field("/attachment/type") == Some("queued_command")
+                    && field("/attachment/commandMode") == Some("prompt") =>
+            {
+                claude_prompt_text(record.pointer("/attachment/prompt"))
+            }
+            _ => None,
+        };
+        if let Some(text) = text {
+            prompts.push((text, parent));
+        }
+    }
+    Ok(ClaudeForkPoints {
+        prompts: prompts
+            .into_iter()
+            .map(|(text, parent)| ClaudePrompt {
+                text,
+                after: claude_message_at_or_before(&entries, parent),
+            })
+            .collect(),
+        last,
+    })
+}
+
+/// What the user typed, as Claude recorded it. MonoCode sends the typed text
+/// first and files after it; a tool result is not a prompt.
+fn claude_prompt_text(content: Option<&serde_json::Value>) -> Option<String> {
+    fn kind(block: &serde_json::Value) -> Option<&str> {
+        block.get("type").and_then(serde_json::Value::as_str)
+    }
+    match content? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(blocks) => {
+            if blocks
+                .iter()
+                .any(|block| kind(block) == Some("tool_result"))
+            {
+                return None;
+            }
+            blocks
+                .iter()
+                .filter(|block| kind(block) == Some("text"))
+                .find_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+        }
+        _ => None,
+    }
+}
+
+fn claude_message_at_or_before(
+    entries: &HashMap<String, (bool, Option<String>)>,
+    mut id: Option<String>,
+) -> Option<String> {
+    // Bounded, so a parent loop in a damaged file cannot hang the read.
+    for _ in 0..=entries.len() {
+        let current = id?;
+        let (message, parent) = entries.get(&current)?;
+        if *message {
+            return Some(current);
+        }
+        id = parent.clone();
+    }
+    None
 }
 
 fn claude_shell_commands_from_file(
@@ -6027,6 +6170,46 @@ mod tests {
         assert_eq!(
             commands,
             HashMap::from([("toolu_one".into(), "npm test".into())])
+        );
+    }
+
+    #[test]
+    fn claude_fork_points_cut_after_the_message_before_each_prompt() {
+        let dir = tmp("claude-fork-points");
+        let path = dir.0.join("session.jsonl");
+        let records = [
+            serde_json::json!({"type":"attachment","uuid":"hook","parentUuid":null}),
+            serde_json::json!({"type":"user","uuid":"p1","parentUuid":"hook","message":{"content":"first"}}),
+            serde_json::json!({"type":"assistant","uuid":"a1","parentUuid":"p1","message":{"content":[{"type":"text","text":"ok"}]}}),
+            serde_json::json!({"type":"user","uuid":"r1","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"x"}]}}),
+            serde_json::json!({"type":"attachment","uuid":"q1","parentUuid":"r1","attachment":{"type":"queued_command","commandMode":"prompt","prompt":[{"type":"text","text":"steer"}]}}),
+            serde_json::json!({"type":"attachment","uuid":"n1","parentUuid":"q1","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"task done"}}),
+            serde_json::json!({"type":"assistant","uuid":"a2","parentUuid":"n1","message":{"content":[{"type":"text","text":"done"}]}}),
+            serde_json::json!({"type":"user","uuid":"sub","parentUuid":"a2","isSidechain":true,"message":{"content":"subagent task"}}),
+            serde_json::json!({"type":"system","uuid":"s1","parentUuid":"a2","subtype":"stop_hook_summary"}),
+            serde_json::json!({"type":"user","uuid":"m1","parentUuid":"s1","isMeta":true,"message":{"content":"caveat"}}),
+            serde_json::json!({"type":"user","uuid":"cs","parentUuid":"m1","isCompactSummary":true,"message":{"content":"summary"}}),
+            serde_json::json!({"type":"attachment","uuid":"loop1","parentUuid":"loop2"}),
+            serde_json::json!({"type":"attachment","uuid":"loop2","parentUuid":"loop1"}),
+            serde_json::json!({"type":"user","uuid":"p2","parentUuid":"loop1","message":{"content":"second"}}),
+            serde_json::json!({"type":"user","uuid":"p3","parentUuid":"cs","message":{"content":[{"type":"text","text":"third"},{"type":"text","text":"/tmp/file.txt"}]}}),
+        ];
+        std::fs::write(&path, records.map(|record| record.to_string()).join("\n")).unwrap();
+        let prompt = |text: &str, after: Option<&str>| ClaudePrompt {
+            text: text.into(),
+            after: after.map(str::to_owned),
+        };
+        assert_eq!(
+            claude_fork_points_from_file(&path).unwrap(),
+            ClaudeForkPoints {
+                prompts: vec![
+                    prompt("first", None),
+                    prompt("steer", Some("r1")),
+                    prompt("second", None),
+                    prompt("third", Some("cs")),
+                ],
+                last: Some("p3".into()),
+            }
         );
     }
 

@@ -282,8 +282,11 @@ import {
 } from "../features/sessions/model/handoff";
 import {
   canForkSession,
-  forkPoint,
+  forkCut,
+  forkPointBefore,
   forkedSession,
+  sentUser,
+  type ForkFrom,
 } from "../features/sessions/model/fork";
 import { requestOutgoingHandoff } from "../features/sessions/model/handoffTurn";
 import {
@@ -8422,26 +8425,47 @@ export default function App({
     [openSessionBeside],
   );
 
-  /** Copy a conversation into a new tab, through `turn` or all of it. */
+  /** Copy a conversation into a new tab: all of it, or what is above a message. */
   const onForkSession = useCallback(
-    async (sourceId: string, turn?: Block[]) => {
+    async (sourceId: string, from?: ForkFrom) => {
       const source = await ensureOpenSession(sourceId);
       const providerSessionId = source?.providerSessionId;
       if (!source || !providerSessionId || !canForkSession(source)) return;
-      const point = turn ? forkPoint(source.blocks, turn) : {};
-      if (!point) return;
-      const session = forkedSession(
-        source,
-        point.providerTurnId ? turn : undefined,
-      );
-      forkHarnessSession({
-        harness: source.harness,
-        threadId: session.id,
-        providerSessionId,
-        cwd: sessionWorkCwd(source),
-        providerAccountId: source.providerAccountId,
-        providerTurnId: point.providerTurnId,
-      });
+      const cut = forkCut(source, from);
+      if (!cut) {
+        void message(
+          "Nothing to fork yet.\n\nWait for Claude to finish what it is doing, then fork again.",
+          { title: "MonoCode", kind: "info" },
+        );
+        return;
+      }
+      const kept =
+        cut.index < 0 ? undefined : source.blocks.slice(0, cut.index);
+      // Above the first message there is nothing to copy: a fresh
+      // conversation that starts with it.
+      const copies = !kept || kept.some(sentUser);
+      const point = copies ? await forkPointBefore(source, cut.index) : null;
+      if (kept && copies && !point) {
+        void message(
+          "Could not fork from here.\n\nClaude's own record of this conversation does not show this message, so there is no point to copy it from.",
+          { title: "MonoCode", kind: "warning" },
+        );
+        return;
+      }
+      const session: Session = {
+        ...forkedSession(source, kept),
+        ...(cut.prefill ? { composerSeed: cut.prefill } : {}),
+      };
+      if (copies) {
+        forkHarnessSession({
+          harness: source.harness,
+          threadId: session.id,
+          providerSessionId,
+          cwd: sessionWorkCwd(source),
+          providerAccountId: source.providerAccountId,
+          providerTurnId: point ?? undefined,
+        });
+      }
       const nextSessions = [...sessionsRef.current, session];
       sessionsRef.current = nextSessions;
       setSessions(nextSessions);

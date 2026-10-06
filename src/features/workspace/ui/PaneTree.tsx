@@ -51,6 +51,7 @@ import { FilePane } from "../../files/ui/FilePane";
 import { SessionPane } from "../../sessions/ui/SessionPane";
 import type { TranscriptPool } from "../../sessions/ui/TranscriptPool";
 import type { SessionFolderTarget } from "../../sessions/model/sessionFolders";
+import type { ForkFrom } from "../../sessions/model/fork";
 import type { Worktree } from "../../source-control/model/worktrees";
 
 type Shared = {
@@ -158,7 +159,7 @@ type Shared = {
     turn: Block[],
   ) => void;
   onHandoff?: (sessionId: string, target: ModelTarget, turn: Block[]) => void;
-  onFork?: (sessionId: string, turn?: Block[]) => void;
+  onFork?: (sessionId: string, from?: ForkFrom) => void;
   onBtwSubmit?: (
     sessionId: string,
     turn: Block[],

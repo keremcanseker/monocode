@@ -89,6 +89,22 @@ export function claudeShellCommands(
   });
 }
 
+/** A prompt in a Claude transcript and the message before it, if any. */
+export type ClaudePrompt = { text: string; after: string | null };
+
+/** Where a Claude conversation can be forked: before a prompt, or at its end. */
+export type ClaudeForkPoints = { prompts: ClaudePrompt[]; last: string | null };
+
+export function claudeForkPoints(
+  providerSessionId: string,
+  providerAccountId: string | undefined,
+): Promise<ClaudeForkPoints> {
+  return invoke<ClaudeForkPoints>("claude_fork_points", {
+    providerSessionId,
+    providerAccountId,
+  });
+}
+
 export type FsEntry = {
   name: string;
   path: string;

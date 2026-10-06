@@ -70,7 +70,7 @@ import { playCue } from "../../settings/model/sounds";
 import { legacyTaskListFromText } from "../model/taskList";
 import { resolveModel } from "../model/models";
 import { harnessForTurn } from "../model/secondOpinion";
-import { forkPoint } from "../model/fork";
+import { forkAfterTurn, type ForkFrom } from "../model/fork";
 import { Shimmer } from "../../../shared/ui/Shimmer";
 import {
   hasPendingApproval,
@@ -202,8 +202,8 @@ type Props = {
   planBuildTargets?: boolean;
   onSecondOpinion?: (target: ModelTarget, turn: Block[]) => void;
   onHandoff?: (target: ModelTarget, turn: Block[]) => void;
-  /** Copy the conversation through this turn into a new tab. */
-  onFork?: (turn: Block[]) => void;
+  /** Copy the conversation into a new tab, cut where `from` says. */
+  onFork?: (from?: ForkFrom) => void;
   onEditLastTurn?: () => void;
   editingLastTurn?: boolean;
   onJumpToBottomChange?: (show: boolean) => void;
@@ -284,6 +284,15 @@ function AgentTranscriptComponent({
   const editableUserBlockId = useMemo(
     () => lastUserTurnBlock(blocks)?.id,
     [blocks],
+  );
+  // The pane hands down a new callback on every render; a stable one keeps
+  // the memoized rows from redrawing with each streamed token.
+  const onForkRef = useRef(onFork);
+  onForkRef.current = onFork;
+  const forkFromMessage = useCallback(
+    (block: Block) =>
+      onForkRef.current?.({ beforeBlockId: block.id, prefill: true }),
+    [],
   );
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const scroller = useRef<HTMLDivElement>(null);
@@ -905,6 +914,11 @@ function AgentTranscriptComponent({
                     ? onEditLastTurn
                     : undefined
                 }
+                onForkFrom={
+                  onFork && item.block.role === "user" && !item.block.draft
+                    ? forkFromMessage
+                    : undefined
+                }
                 editing={
                   editingLastTurn &&
                   item.block.role === "user" &&
@@ -1060,8 +1074,8 @@ function AgentTranscriptComponent({
                     onHandoff ? (target) => onHandoff(target, turn) : undefined
                   }
                   onFork={
-                    onFork && forkPoint(blocks, turn)
-                      ? () => onFork(turn)
+                    onFork
+                      ? () => onFork(forkAfterTurn(blocks, turn))
                       : undefined
                   }
                 />
@@ -1220,18 +1234,7 @@ function TurnDuration({
           <Check className="size-3.5" strokeWidth={1.75} />
         )}
         {onFork ? (
-          <button
-            type="button"
-            title="Fork from here"
-            aria-label="Fork from here"
-            className="rounded-md p-1 text-content/40 hover:bg-content/8 hover:text-content/70"
-            onClick={(event) => {
-              event.stopPropagation();
-              onFork();
-            }}
-          >
-            <GitFork className="size-3.5" strokeWidth={1.75} />
-          </button>
+          <ForkButton label="Fork after this reply" onFork={onFork} />
         ) : null}
         {fromHarness && onHandoff ? (
           <HandoffButton from={fromHarness} onPick={onHandoff} />
@@ -1500,6 +1503,23 @@ function SaveNoteButton({
   );
 }
 
+function ForkButton({ label, onFork }: { label: string; onFork: () => void }) {
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      className="rounded-md p-1 text-content/40 hover:bg-content/8 hover:text-content/70"
+      onClick={(event) => {
+        event.stopPropagation();
+        onFork();
+      }}
+    >
+      <GitFork className="size-3.5" strokeWidth={1.75} />
+    </button>
+  );
+}
+
 function EditLastTurnButton({
   onEdit,
   editing = false,
@@ -1550,6 +1570,7 @@ const TranscriptBlock = memo(function TranscriptBlock({
   planModelSettings,
   onEditLastTurn,
   editing = false,
+  onForkFrom,
 }: {
   block: Block;
   layout: TranscriptLayout;
@@ -1573,6 +1594,8 @@ const TranscriptBlock = memo(function TranscriptBlock({
   planModelSettings?: Record<string, string>;
   onEditLastTurn?: () => void;
   editing?: boolean;
+  /** Fork from a user message, which goes back into the new tab's composer. */
+  onForkFrom?: (block: Block) => void;
 }) {
   if (block.role === "user") {
     return (
@@ -1583,6 +1606,7 @@ const TranscriptBlock = memo(function TranscriptBlock({
         cwd={cwd}
         onEdit={onEditLastTurn}
         editing={editing}
+        onFork={onForkFrom ? () => onForkFrom(block) : undefined}
         onSaveNote={onSaveNote}
         onSendDraft={onSendDraft}
         onRemoveDraft={onRemoveDraft}
@@ -1705,6 +1729,7 @@ function UserMessageBlock({
   stickyIndex,
   onEdit,
   editing = false,
+  onFork,
   cwd,
   onSaveNote,
   onSendDraft,
@@ -1715,6 +1740,7 @@ function UserMessageBlock({
   stickyIndex: number;
   onEdit?: () => void;
   editing?: boolean;
+  onFork?: () => void;
   cwd?: string;
   onSaveNote?: (text: string) => void | Promise<void>;
   onSendDraft?: (block: Block) => boolean | void;
@@ -1926,7 +1952,8 @@ function UserMessageBlock({
         {text ||
         block.attachments?.length ||
         block.startedAt != null ||
-        onEdit ? (
+        onEdit ||
+        onFork ? (
           <div className="user-message-actions flex items-center gap-1 px-3 pt-1">
             {text || block.attachments?.length ? (
               <CopyTurnButton
@@ -1934,6 +1961,9 @@ function UserMessageBlock({
                 attachments={block.attachments}
                 label="Copy message"
               />
+            ) : null}
+            {onFork ? (
+              <ForkButton label="Fork from this message" onFork={onFork} />
             ) : null}
             {onEdit ? (
               <EditLastTurnButton onEdit={onEdit} editing={editing} />
