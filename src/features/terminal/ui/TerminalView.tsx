@@ -1,4 +1,6 @@
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useEffect, useRef } from "react";
 import {
   getPtyStatus,
@@ -34,6 +36,13 @@ type Props = {
   active: boolean;
   onMetaChange?: (patch: TerminalMetaPatch) => void;
 };
+
+/** Cmd+click (Ctrl+click elsewhere) opens a link in the browser, like VS Code. */
+export function openTerminalLink(event: MouseEvent, url: string): void {
+  if (!(IS_MAC ? event.metaKey : event.ctrlKey)) return;
+  if (!/^https?:\/\//i.test(url)) return;
+  void openUrl(url).catch(() => undefined);
+}
 
 function cssColor(expr: string, fallback: string): string {
   const probe = document.createElement("span");
@@ -165,7 +174,10 @@ export function TerminalView({ id, cwd, active, onMetaChange }: Props) {
       smoothScrollDuration: 0,
       theme: terminalTheme(isLightScheme()),
       macOptionIsMeta: IS_MAC,
+      // OSC 8 hyperlinks; plain URLs in the output go through the addon.
+      linkHandler: { activate: openTerminalLink },
     });
+    term.loadAddon(new WebLinksAddon(openTerminalLink));
     term.open(host);
     termRef.current = term;
     let closed = false;
