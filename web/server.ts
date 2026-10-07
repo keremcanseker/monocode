@@ -222,13 +222,31 @@ const TYPES: Record<string, string> = {
   ".wasm": "application/wasm",
 };
 
+// statSync still throws for NUL bytes and over-long names; an uncaught throw here would stop the server.
+const isFile = (file: string) => {
+  try {
+    return statSync(file, { throwIfNoEntry: false })?.isFile() ?? false;
+  } catch {
+    return false;
+  }
+};
+
 /** Production server: the built UI with a strict CSP plus the /rpc gate, nothing else. */
 export function createWebServer(web: WebSettings, root: string, host = hostSettings()) {
   root = resolve(root);
   const csp = contentSecurityPolicy(inlineScriptHashes(readFileSync(join(root, "index.html"), "utf8")), false);
   const headers = securityHeaders(csp);
   const gate = createRpcGate({ ...host, key: web.key, allowedOrigins: [web.origin] });
-  return createServer((req, res) =>
+  return createServer((req, res) => {
+    try {
+      route(req, res);
+    } catch {
+      if (res.headersSent) res.destroy();
+      else refuse(res, 500, "Internal error");
+    }
+  });
+
+  function route(req: IncomingMessage, res: ServerResponse) {
     headers(req, res, () =>
       gate(req, res, () => {
         if (req.method !== "GET" && req.method !== "HEAD") return refuse(res, 405, "GET only");
@@ -240,16 +258,15 @@ export function createWebServer(web: WebSettings, root: string, host = hostSetti
         }
         if (file === root) file = join(root, "index.html");
         const type = TYPES[extname(file)];
-        if (!type || !file.startsWith(root + sep) || !statSync(file, { throwIfNoEntry: false })?.isFile())
-          return refuse(res, 404, "Not found");
+        if (!type || !file.startsWith(root + sep) || !isFile(file)) return refuse(res, 404, "Not found");
         res.setHeader("Content-Type", type);
         // Vite content-hashes everything under assets/, so a changed file gets a new name.
         if (file.startsWith(join(root, "assets") + sep)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
         if (req.method === "HEAD") return res.end();
         createReadStream(file).on("error", () => res.destroy()).pipe(res);
       }),
-    ),
-  );
+    );
+  }
 }
 
 /** Serves the unmodified desktop UI in a browser, backed by a MonoCode host. */

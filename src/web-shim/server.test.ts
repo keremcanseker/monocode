@@ -297,6 +297,13 @@ describe("createWebServer", () => {
     },
   );
 
+  it.each(["/a%00.js", `/${"a".repeat(300)}.js`])("stays up after a path stat cannot handle (%s)", async (path) => {
+    const { server, url } = await webServer();
+    expect((await call(url, { path, method: "GET", headers: proxied, body: "" })).status).toBe(404);
+    expect((await call(url, { path: "/assets/app.js", method: "GET", headers: proxied, body: "" })).status).toBe(200);
+    await close(server);
+  });
+
   it("refuses writes outside /rpc", async () => {
     const { server, url } = await webServer();
     expect((await call(url, { path: "/", headers: proxied })).status).toBe(405);
