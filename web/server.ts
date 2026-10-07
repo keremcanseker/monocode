@@ -1,8 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, extname, join, resolve, sep } from "node:path";
 import type { Plugin, ResolvedConfig } from "vite";
 
 const MAX_BODY = 16 * 1024 * 1024;
@@ -145,7 +145,7 @@ export function contentSecurityPolicy(scriptSources: string[], dev: boolean) {
   ].join("; ");
 }
 
-const securityHeaders =
+export const securityHeaders =
   (csp: string): Middleware =>
   (_req, res, next) => {
     res.setHeader("Content-Security-Policy", csp);
@@ -159,21 +159,46 @@ function assertLoopback(host: string | boolean | undefined, where: string) {
   if (host !== BIND) throw new Error(`MonoCode web must bind to ${BIND} only (${where}.host=${String(host)})`);
 }
 
-export function parseHostUrl(value: string) {
+export function parseHostUrl(value: string, name = "MONOCODE_HOST_URL") {
   let url: URL;
   try {
     url = new URL(value);
   } catch {
-    throw new Error(`MONOCODE_HOST_URL is not a URL: ${value}`);
+    throw new Error(`${name} is not a URL: ${value}`);
   }
   if (url.protocol !== "http:" && url.protocol !== "https:")
-    throw new Error(`MONOCODE_HOST_URL must be http(s): ${value}`);
+    throw new Error(`${name} must be http(s): ${value}`);
   if (url.pathname !== "/" || url.search || url.hash)
-    throw new Error(`MONOCODE_HOST_URL must be just scheme://host:port: ${value}`);
+    throw new Error(`${name} must be just scheme://host:port: ${value}`);
   return url.origin;
 }
 
-function hostSettings() {
+export type WebSettings = { bind: string; port: number; origin: string; key: string; url: string };
+
+/** Loopback with a per-start key by default; anything wider needs an https public origin and a fixed key. */
+export function webSettings(env: Record<string, string | undefined> = process.env): WebSettings {
+  const port = Number(env.MONOCODE_WEB_PORT ?? 1430);
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error(`MONOCODE_WEB_PORT is not a port: ${env.MONOCODE_WEB_PORT}`);
+  const bind = env.MONOCODE_WEB_BIND ?? BIND;
+  const fixed = env.MONOCODE_WEB_KEY;
+  // URLSearchParams turns "+" into a space, so base64 keys would never match.
+  if (fixed !== undefined && !/^[A-Za-z0-9_-]{32,}$/.test(fixed))
+    throw new Error("MONOCODE_WEB_KEY must be 32+ characters of A-Z a-z 0-9 _ -");
+  if (!env.MONOCODE_WEB_ORIGIN) {
+    if (bind !== BIND) throw new Error(`MONOCODE_WEB_BIND=${bind} needs MONOCODE_WEB_ORIGIN and MONOCODE_WEB_KEY`);
+    const key = fixed ?? randomBytes(32).toString("base64url");
+    const origin = `http://${BIND}:${port}`;
+    return { bind, port, origin, key, url: `${origin}/#key=${key}` };
+  }
+  const origin = parseHostUrl(env.MONOCODE_WEB_ORIGIN, "MONOCODE_WEB_ORIGIN");
+  if (!origin.startsWith("https://")) throw new Error(`MONOCODE_WEB_ORIGIN must be https: ${origin}`);
+  if (!fixed) throw new Error("MONOCODE_WEB_ORIGIN needs MONOCODE_WEB_KEY");
+  // The fixed key stays out of logs; whoever set it opens the URL with it.
+  return { bind, port, origin, key: fixed, url: `${origin}/#key=<MONOCODE_WEB_KEY>` };
+}
+
+export function hostSettings() {
   const tokenFile =
     process.env.MONOCODE_HOST_TOKEN_FILE ?? join(homedir(), ".monocode-host-web", "web-proxy.token");
   const token = existsSync(tokenFile) ? readFileSync(tokenFile, "utf8").trim() : undefined;
@@ -183,6 +208,48 @@ function hostSettings() {
     token: valid,
     tokenFile,
   };
+}
+
+const TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".json": "application/json",
+  ".woff2": "font/woff2",
+  ".wasm": "application/wasm",
+};
+
+/** Production server: the built UI with a strict CSP plus the /rpc gate, nothing else. */
+export function createWebServer(web: WebSettings, root: string, host = hostSettings()) {
+  root = resolve(root);
+  const csp = contentSecurityPolicy(inlineScriptHashes(readFileSync(join(root, "index.html"), "utf8")), false);
+  const headers = securityHeaders(csp);
+  const gate = createRpcGate({ ...host, key: web.key, allowedOrigins: [web.origin] });
+  return createServer((req, res) =>
+    headers(req, res, () =>
+      gate(req, res, () => {
+        if (req.method !== "GET" && req.method !== "HEAD") return refuse(res, 405, "GET only");
+        let file: string;
+        try {
+          file = resolve(root, `.${decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname)}`);
+        } catch {
+          return refuse(res, 400, "Bad path");
+        }
+        if (file === root) file = join(root, "index.html");
+        const type = TYPES[extname(file)];
+        if (!type || !file.startsWith(root + sep) || !statSync(file, { throwIfNoEntry: false })?.isFile())
+          return refuse(res, 404, "Not found");
+        res.setHeader("Content-Type", type);
+        // Vite content-hashes everything under assets/, so a changed file gets a new name.
+        if (file.startsWith(join(root, "assets") + sep)) res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        if (req.method === "HEAD") return res.end();
+        createReadStream(file).on("error", () => res.destroy()).pipe(res);
+      }),
+    ),
+  );
 }
 
 /** Serves the unmodified desktop UI in a browser, backed by a MonoCode host. */
@@ -207,7 +274,6 @@ export function monocodeWeb(): Plugin {
     configResolved(resolved) {
       config = resolved;
       assertLoopback(resolved.server.host, "server");
-      assertLoopback(resolved.preview.host, "preview");
     },
     transformIndexHtml: {
       order: "pre",
@@ -220,14 +286,6 @@ export function monocodeWeb(): Plugin {
     configureServer(server) {
       const port = config.server.port ?? 1430;
       server.middlewares.use(securityHeaders(contentSecurityPolicy([], true)));
-      server.middlewares.use(gate(port));
-      server.httpServer?.once("listening", () => announce(port));
-    },
-    configurePreviewServer(server) {
-      const port = config.preview.port ?? 1430;
-      const index = resolve(config.root, config.build.outDir, "index.html");
-      const hashes = existsSync(index) ? inlineScriptHashes(readFileSync(index, "utf8")) : [];
-      server.middlewares.use(securityHeaders(contentSecurityPolicy(hashes, false)));
       server.middlewares.use(gate(port));
       server.httpServer?.once("listening", () => announce(port));
     },

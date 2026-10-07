@@ -8,7 +8,6 @@ export default defineConfig(async (env: ConfigEnv) => {
   const config = mergeConfig(base, {
     plugins: [monocodeWeb()],
     server: { host: "127.0.0.1", port: 1430, strictPort: true, cors: false },
-    preview: { host: "127.0.0.1", port: 1430, strictPort: true, cors: false },
     // The dependency scan reads index.html before the entry swap, so it never sees the shim.
     optimizeDeps: { include: ["@tauri-apps/api/mocks"] },
   });

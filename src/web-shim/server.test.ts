@@ -1,12 +1,17 @@
 import { createServer, request, type IncomingHttpHeaders, type Server } from "node:http";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   contentSecurityPolicy,
   createRpcGate,
+  createWebServer,
   inlineScriptHashes,
   monocodeWeb,
   parseHostUrl,
+  webSettings,
 } from "../../web/server";
 
 const TOKEN = "a".repeat(43);
@@ -219,5 +224,93 @@ describe("parseHostUrl", () => {
 
   it.each(["127.0.0.1:3774", "ftp://host", "http://127.0.0.1:3774/rpc", "http://h/?x=1", "nope"])("rejects %s", (value) => {
     expect(() => parseHostUrl(value)).toThrow(/MONOCODE_HOST_URL/);
+  });
+});
+
+describe("webSettings", () => {
+  const KEY64 = "k".repeat(64);
+  const PUBLIC = "https://monocode.istfin.com";
+
+  it("defaults to 127.0.0.1 with a new key per start, printed in the URL", () => {
+    const a = webSettings({});
+    expect(a).toMatchObject({ bind: "127.0.0.1", port: 1430, origin: ORIGIN });
+    expect(a.key).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(a.key).not.toBe(webSettings({}).key);
+    expect(a.url).toBe(`${ORIGIN}/#key=${a.key}`);
+  });
+
+  it("serves a public https origin with the fixed key and keeps the key out of the printed URL", () => {
+    const env = { MONOCODE_WEB_BIND: "0.0.0.0", MONOCODE_WEB_ORIGIN: `${PUBLIC}/`, MONOCODE_WEB_KEY: KEY64 };
+    expect(webSettings(env)).toEqual({
+      bind: "0.0.0.0",
+      port: 1430,
+      origin: PUBLIC,
+      key: KEY64,
+      url: `${PUBLIC}/#key=<MONOCODE_WEB_KEY>`,
+    });
+  });
+
+  it.each([
+    ["a wide bind without a public origin", { MONOCODE_WEB_BIND: "0.0.0.0" }, /needs MONOCODE_WEB_ORIGIN/],
+    ["a plain http public origin", { MONOCODE_WEB_ORIGIN: "http://monocode.istfin.com", MONOCODE_WEB_KEY: KEY64 }, /must be https/],
+    ["a public origin with a path", { MONOCODE_WEB_ORIGIN: `${PUBLIC}/app`, MONOCODE_WEB_KEY: KEY64 }, /MONOCODE_WEB_ORIGIN/],
+    ["a public origin without a fixed key", { MONOCODE_WEB_ORIGIN: PUBLIC }, /needs MONOCODE_WEB_KEY/],
+    ["a short key", { MONOCODE_WEB_KEY: "short" }, /32\+/],
+    ["a base64 key that URLSearchParams would mangle", { MONOCODE_WEB_KEY: "a+/=".repeat(10) }, /32\+/],
+    ["an invalid port", { MONOCODE_WEB_PORT: "70000" }, /not a port/],
+  ])("refuses %s", (_, env, message) => {
+    expect(() => webSettings(env)).toThrow(message);
+  });
+});
+
+describe("createWebServer", () => {
+  const PUBLIC = "https://monocode.istfin.com";
+  const KEY64 = "k".repeat(64);
+  const root = mkdtempSync(join(tmpdir(), "monocode-web-"));
+  mkdirSync(join(root, "assets"));
+  writeFileSync(join(root, "index.html"), '<script>boot()</script><script type="module" src="/assets/app.js"></script>');
+  writeFileSync(join(root, "assets", "app.js"), "export {}");
+  writeFileSync(join(root, "assets", "notes.md"), "not served");
+  const proxied = { host: "monocode.istfin.com", "x-forwarded-proto": "https", "x-forwarded-for": "100.64.0.9" };
+
+  async function webServer() {
+    const web = webSettings({ MONOCODE_WEB_BIND: "0.0.0.0", MONOCODE_WEB_ORIGIN: PUBLIC, MONOCODE_WEB_KEY: KEY64 });
+    const server = createWebServer(web, root, { hostUrl, token: TOKEN, tokenFile: "" });
+    return { server, url: await listen(server) };
+  }
+
+  it("serves the UI and its assets to a proxied public Host", async () => {
+    const { server, url } = await webServer();
+    const page = await call(url, { path: "/", method: "GET", headers: proxied, body: "" });
+    expect(page.status).toBe(200);
+    const asset = await call(url, { path: "/assets/app.js", method: "GET", headers: proxied, body: "" });
+    expect(asset).toEqual({ status: 200, body: "export {}" });
+    await close(server);
+  });
+
+  it.each(["/../package.json", "/%2e%2e/package.json", "/assets/..%2F..%2Fpackage.json", "/assets/notes.md", "/missing.js", "/%E0%A4%A"])(
+    "does not serve %s",
+    async (path) => {
+      const { server, url } = await webServer();
+      expect([400, 404]).toContain((await call(url, { path, method: "GET", headers: proxied, body: "" })).status);
+      await close(server);
+    },
+  );
+
+  it("refuses writes outside /rpc", async () => {
+    const { server, url } = await webServer();
+    expect((await call(url, { path: "/", headers: proxied })).status).toBe(405);
+    await close(server);
+  });
+
+  it("forwards /rpc only from the public origin, and never forwards proxy headers", async () => {
+    const { server, url } = await webServer();
+    const ok = { ...proxied, origin: PUBLIC, "sec-fetch-site": "same-origin", "x-monocode-web-key": KEY64 };
+    expect((await call(url, { headers: ok })).status).toBe(200);
+    expect(seen[0].headers["x-forwarded-for"]).toBeUndefined();
+    expect(seen[0].headers["x-forwarded-proto"]).toBeUndefined();
+    expect((await call(url, { headers: { ...ok, origin: ORIGIN } })).status).toBe(403);
+    expect(seen).toHaveLength(1);
+    await close(server);
   });
 });
