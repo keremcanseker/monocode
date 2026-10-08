@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, expect, it, vi } from "vitest";
+import { OPEN_REMOTE_PROJECT_EVENT } from "../features/connections/model/connections";
 import { dialogMessage, handleCommand, openUrl } from "./commands";
 
 const ui = (answer = true) =>
@@ -72,6 +73,20 @@ describe("handleCommand", () => {
     localStorage.setItem("monocode.web.machine.v1", JSON.stringify({ environmentId: "env-1", name: "mac" }));
     await expect(handleCommand("remote_disconnect", { machineId: "web-host" })).resolves.toBeNull();
     expect(localStorage.getItem("monocode.web.machine.v1")).toBeNull();
+  });
+
+  it("opens the machine folder dialog in place of the local folder picker", async () => {
+    const opened = vi.fn();
+    window.addEventListener(OPEN_REMOTE_PROJECT_EVENT, opened);
+    await expect(
+      handleCommand("plugin:dialog|open", { options: { directory: true, multiple: true } }),
+    ).resolves.toBeNull();
+    expect(opened).toHaveBeenCalledOnce();
+    await expect(handleCommand("plugin:dialog|open", { options: { multiple: false } })).rejects.toBe(
+      "plugin:dialog|open is not available in the browser",
+    );
+    expect(opened).toHaveBeenCalledOnce();
+    window.removeEventListener(OPEN_REMOTE_PROJECT_EVENT, opened);
   });
 
   it("reports a web app version", async () => {

@@ -28,6 +28,18 @@ export function dialogMessage(args: Args, ui = window): string {
   return typeof buttons === "object" && "OkCustom" in buttons ? buttons.OkCustom : "Ok";
 }
 
+const unavailable = (cmd: string) => `${cmd} is not available in the browser`;
+
+/** The only folder picker opens projects, and in a browser those live on the host. */
+async function pickHostFolder(args: Args) {
+  if (!(args?.options as { directory?: boolean } | undefined)?.directory)
+    throw unavailable("plugin:dialog|open");
+  // Loaded on click, not at boot: the shim runs before the app's modules may touch Tauri.
+  const { OPEN_REMOTE_PROJECT_EVENT } = await import("../features/connections/model/connections");
+  window.dispatchEvent(new Event(OPEN_REMOTE_PROJECT_EVENT));
+  return null;
+}
+
 export function openUrl(args: Args, ui = window) {
   const url = String(args?.url ?? "");
   if (!SAFE_URL.test(url)) throw `Refusing to open ${url || "an empty URL"}`;
@@ -56,6 +68,7 @@ const handlers: Record<string, (args: Args) => unknown> = {
   remote_machines: () => webMachines(),
   remote_disconnect: () => forgetWebMachine(),
   "plugin:dialog|message": (args) => dialogMessage(args),
+  "plugin:dialog|open": (args) => pickHostFolder(args),
   "plugin:opener|open_url": (args) => openUrl(args),
   "plugin:app|version": () => "web",
 };
@@ -63,6 +76,6 @@ const handlers: Record<string, (args: Args) => unknown> = {
 /** Every Tauri IPC call lands here; anything local-only rejects like a failed command. */
 export async function handleCommand(cmd: string, args: Args): Promise<unknown> {
   const handler = handlers[cmd];
-  if (!handler) throw `${cmd} is not available in the browser`;
+  if (!handler) throw unavailable(cmd);
   return handler(args);
 }
