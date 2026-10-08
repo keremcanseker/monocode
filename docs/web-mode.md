@@ -42,12 +42,10 @@ instead of a new one per start; 32+ characters of `A-Z a-z 0-9 _ -`).
 
 ## Run behind a TLS reverse proxy (container)
 
-`web/Dockerfile` builds one image on top of the official Hermes Agent image
-(`nousresearch/hermes-agent`, pinned) and adds pinned Claude Code and OpenCode.
-`tini` is PID 1, so the Hermes entrypoint prepares `/opt/data` as root and then
-runs `web/entrypoint.sh` as the unprivileged `hermes` user with
-`HOME=/opt/data`. The entrypoint pairs the web server with the host on first
-boot, then runs both; either one exiting stops the container.
+`web/Dockerfile` builds one image on `node:24` with pinned Claude Code and
+OpenCode. It runs as the unprivileged `node` user, whose home is the volume
+`/opt/data`, with `tini` as PID 1. The entrypoint pairs the web server with the
+host on first boot, then runs both; either one exiting stops the container.
 
 ```sh
 docker build -f web/Dockerfile -t monocode-web .
@@ -67,12 +65,16 @@ docker run -d -p 127.0.0.1:1430:1430 \
   changing the variable and restarting.
 - The single volume `/opt/data` holds the host data (`.monocode-host-web`),
   provider logins and keys (`.claude`, `.claude.json`, `.local/share/opencode`,
-  Hermes' `config.yaml` and `.env`) and projects (`workspace/`). Delete
+  `.config/opencode`) and projects (for example `workspace/`). Delete
   `.monocode-host-web/web-proxy.token` to re-pair.
-- Run one-time logins as the image user so files stay owned by it:
-  `docker exec -it -u hermes -e HOME=/opt/data <container> claude auth login`.
-  Never put `ANTHROPIC_API_KEY` in the container environment: the host passes
+- `docker exec` runs as `node` by default, so one-time setup lands in the volume
+  with the right owner: `docker exec -it <container> claude auth login`, and
+  OpenCode's key goes to `/opt/data/.local/share/opencode/auth.json` (the same
+  file `opencode auth login` writes). Do not exec as root into `/opt/data`.
+- Never put `ANTHROPIC_API_KEY` in the container environment: the host passes
   its environment to providers, and an API key wins over the subscription.
+- OpenCode stays on 1.x: the 2.x CLI has no `models --verbose`, so MonoCode
+  cannot list its models.
 - Run only one container per volume (disable rolling updates): a second host
   on the same data directory refuses to start.
 - Everyone who has the key and can reach the proxy controls the container's
@@ -86,8 +88,8 @@ from `http://127.0.0.1:<port>` (or `MONOCODE_WEB_ORIGIN`) carrying the launch
 key header, and it builds a fresh request with just the token and content type.
 `devices.revokeSelf` is refused so the page cannot revoke the server's own
 credential. By default the server binds to `127.0.0.1` only (not `localhost`,
-which can resolve to `::1` and leave the IPv4 port free for another process). A `#key=` from a link replaces the stored
-key only after the server accepts it.
+which can resolve to `::1` and leave the IPv4 port free for another process). A
+`#key=` from a link replaces the stored key only after the server accepts it.
 
 `npm run web` serves the production build with a strict CSP (scripts from self
 plus hashed inline scripts, `connect-src 'self'`, no frames). `web:dev` allows

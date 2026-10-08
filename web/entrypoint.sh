@@ -5,6 +5,10 @@ umask 077
 host=/app/build/host/monocode-host.mjs
 data="$HOME/.monocode-host-web" # web/server.ts reads $data/web-proxy.token by default
 
+if [ ! -w "$HOME" ]; then
+  echo "MonoCode web: $HOME is not writable by $(id -un) (uid $(id -u)); use a new volume or chown it to that uid" >&2
+  exit 1
+fi
 mkdir -p "$data"
 if [ ! -s "$data/web-proxy.token" ]; then
   node "$host" pair --data-dir "$data" --name "Web (container)" --json |
