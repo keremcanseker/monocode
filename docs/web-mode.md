@@ -42,10 +42,12 @@ instead of a new one per start; 32+ characters of `A-Z a-z 0-9 _ -`).
 
 ## Run behind a TLS reverse proxy (container)
 
-`web/Dockerfile` builds one image on `node:24` with pinned Claude Code and
-OpenCode. It runs as the unprivileged `node` user, whose home is the volume
-`/opt/data`, with `tini` as PID 1. The entrypoint pairs the web server with the
-host on first boot, then runs both; either one exiting stops the container.
+`web/Dockerfile` builds one image on `node:24` with pinned Claude Code,
+OpenCode and Hermes Agent. It runs as the unprivileged `node` user, whose home
+is the volume `/opt/data`, with `tini` as PID 1. The entrypoint pairs the web
+server with the host on first boot, then runs both plus Hermes' gateway, which
+runs Hermes' scheduled jobs. The host or the web server exiting stops the
+container; the gateway restarts on its own.
 
 ```sh
 docker build -f web/Dockerfile -t monocode-web .
@@ -65,8 +67,15 @@ docker run -d -p 127.0.0.1:1430:1430 \
   changing the variable and restarting.
 - The single volume `/opt/data` holds the host data (`.monocode-host-web`),
   provider logins and keys (`.claude`, `.claude.json`, `.local/share/opencode`,
-  `.config/opencode`) and projects (for example `workspace/`). Delete
-  `.monocode-host-web/web-proxy.token` to re-pair.
+  `.config/opencode`), Hermes' memory, jobs and keys (`.hermes`) and projects
+  (for example `workspace/`). Delete `.monocode-host-web/web-proxy.token` to
+  re-pair.
+- A new `.hermes` starts on Claude through the Claude Code login
+  (`claude-agent-acp`, provider `copilot-acp`), and every start copies the
+  OpenCode Go key into `.hermes/.env` when it has none. Switch Hermes to
+  OpenCode Go with `hermes config set model.provider opencode-go` and
+  `hermes config set model.default glm-5.3`, or pin a single job with
+  `hermes cron create … --provider opencode-go --model glm-5.3`.
 - `docker exec` runs as `node` by default, so one-time setup lands in the volume
   with the right owner: `docker exec -it <container> claude auth login`, and
   OpenCode's key goes to `/opt/data/.local/share/opencode/auth.json` (the same
