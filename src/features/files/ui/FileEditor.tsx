@@ -95,6 +95,7 @@ import { editorLint } from "../editor/editorLint";
 import { editorSearch } from "../editor/editorSearch";
 import { editorScrollbar } from "../editor/editorScrollbar";
 import { FilePreviewSearch } from "./FilePreviewSearch";
+import { BinaryFileView } from "./BinaryFileView";
 
 type EditorNavigationRequest = EditorNavigation & { token: number };
 
@@ -415,6 +416,14 @@ export function FileEditor({
         Opening {basename(path)}…
       </div>
     );
+  }
+
+  // Rust's read_text_file refuses NUL bytes with exactly this message.
+  if (
+    loadState.status === "error" &&
+    loadState.message === "Binary files cannot be edited."
+  ) {
+    return <BinaryFileView path={path} cwd={cwd} />;
   }
 
   if (loadState.status === "error") {
