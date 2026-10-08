@@ -72,7 +72,9 @@ docker run -d -p 127.0.0.1:1430:1430 \
   re-pair.
 - A new `.hermes` starts on Claude through the Claude Code login
   (`claude-agent-acp`, provider `copilot-acp`), and every start copies the
-  OpenCode Go key into `.hermes/.env` when it has none. Switch Hermes to
+  OpenCode Go key into `.hermes/.env` when it has none. The ACP command is
+  set in `.hermes/.env` too, because Hermes drops provider settings that are
+  missing from that file. Switch Hermes to
   OpenCode Go with `hermes config set model.provider opencode-go` and
   `hermes config set model.default glm-5.3`, or pin a single job with
   `hermes cron create … --provider opencode-go --model glm-5.3`.

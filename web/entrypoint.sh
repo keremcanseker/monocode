@@ -18,7 +18,10 @@ fi
 
 # Hermes keeps its memory, jobs and keys in ~/.hermes. A new one starts on Claude through the
 # Claude Code login, and gets the OpenCode Go key from `opencode auth login` when it has none.
+# The ACP command lives in its .env: Hermes drops provider settings that are missing there.
 mkdir -p "$HOME/.hermes"
+grep -qs '^HERMES_COPILOT_ACP_COMMAND=' "$HOME/.hermes/.env" ||
+  printf 'HERMES_COPILOT_ACP_COMMAND=claude-agent-acp\n' >>"$HOME/.hermes/.env"
 if [ ! -e "$HOME/.hermes/config.yaml" ]; then
   { hermes config set model.provider copilot-acp && hermes config set model.default copilot-acp; } >/dev/null ||
     echo "MonoCode web: could not set Hermes' default model" >&2

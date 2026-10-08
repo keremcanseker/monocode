@@ -47,7 +47,7 @@ RUN usermod -d /opt/data node && mkdir -m 700 /opt/data && chown node:node /opt/
 # The user-writable ~/.local/bin goes last so nothing in the volume can shadow the pinned CLIs.
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/data/.local/bin \
     DISABLE_AUTOUPDATER=1 OPENCODE_DISABLE_AUTOUPDATE=1 \
-    HERMES_COPILOT_ACP_COMMAND=claude-agent-acp HERMES_DISABLE_LAZY_INSTALLS=1 \
+    HERMES_DISABLE_LAZY_INSTALLS=1 \
     MONOCODE_WEB_BIND=0.0.0.0 MONOCODE_WEB_PORT=1430
 WORKDIR /app
 COPY --from=build /src/build/host/monocode-host.mjs /src/build/host/provider-guard.mjs build/host/
