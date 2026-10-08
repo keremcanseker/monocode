@@ -26,6 +26,10 @@ if [ ! -e "$HOME/.hermes/config.yaml" ]; then
   { hermes config set model.provider copilot-acp && hermes config set model.default copilot-acp; } >/dev/null ||
     echo "MonoCode web: could not set Hermes' default model" >&2
 fi
+# Never let Hermes borrow the Claude Code login for its own API calls: Anthropic does not allow
+# that for other tools, and Hermes refreshing the shared token can sign Claude Code out.
+hermes config set auth.adopt_external_logins false >/dev/null ||
+  echo "MonoCode web: could not stop Hermes from borrowing the Claude Code login" >&2
 opencode_auth="$HOME/.local/share/opencode/auth.json"
 if [ -s "$opencode_auth" ] && ! grep -qs '^OPENCODE_GO_API_KEY=' "$HOME/.hermes/.env"; then
   key=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))["opencode-go"]?.key ?? ""' "$opencode_auth" 2>/dev/null) || key=""

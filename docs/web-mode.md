@@ -74,7 +74,10 @@ docker run -d -p 127.0.0.1:1430:1430 \
   (`claude-agent-acp`, provider `copilot-acp`), and every start copies the
   OpenCode Go key into `.hermes/.env` when it has none. The ACP command is
   set in `.hermes/.env` too, because Hermes drops provider settings that are
-  missing from that file. Switch Hermes to
+  missing from that file. Every start also sets
+  `auth.adopt_external_logins: false`, so Hermes never uses the Claude Code
+  login for direct Anthropic API calls (its own `anthropic` provider needs an
+  API key and is not set up). Switch Hermes to
   OpenCode Go with `hermes config set model.provider opencode-go` and
   `hermes config set model.default glm-5.3`, or pin a single job with
   `hermes cron create … --provider opencode-go --model glm-5.3`.
