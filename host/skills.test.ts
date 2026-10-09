@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseSkillFrontmatter, withHermesSkills } from "./skills";
+import { hermesMcpNames, parseSkillFrontmatter, withHermesSkills } from "./skills";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -34,5 +34,13 @@ describe("withHermesSkills", () => {
     expect(out.endsWith("/post-yaz süre hataları")).toBe(true);
     expect(withHermesSkills("düz mesaj /yok-boyle", skills)).toBe("düz mesaj /yok-boyle");
     expect(withHermesSkills("a/post-yaz", skills)).toBe("a/post-yaz");
+  });
+});
+
+describe("hermesMcpNames", () => {
+  it("keeps server names and drops every value", () => {
+    const yaml = "treg:\n  url: https://treg.to/mcp/\n  headers:\n    Authorization: Bearer secret\nplaywright:\n  command: playwright-mcp\n  args:\n  - --headless\n";
+    expect(hermesMcpNames(yaml)).toEqual(["treg", "playwright"]);
+    expect(hermesMcpNames("")).toEqual([]);
   });
 });

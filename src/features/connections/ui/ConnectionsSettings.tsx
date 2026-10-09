@@ -12,8 +12,10 @@ import {
   REMOTE_PROVIDERS,
   type HostDescriptor,
   type RemoteMachine,
+  type RemoteProvider,
   type SshSetup,
 } from "../model/protocol";
+import { AgentSetupPanel, INVENTORY_PROVIDERS } from "./AgentSetupPanel";
 
 const input =
   "w-full rounded-lg border border-content/15 bg-content/3 px-3 py-2 text-[13px] outline-none focus:border-content/35";
@@ -37,6 +39,8 @@ export function ConnectionsSettings() {
   const [needsUpdate, setNeedsUpdate] = useState<Record<string, boolean>>({});
   const [updatingMachine, setUpdatingMachine] = useState<string>();
   const [removing, setRemoving] = useState<string>();
+  const [setupProviders, setSetupProviders] = useState<Record<string, RemoteProvider[]>>({});
+  const [setupOpen, setSetupOpen] = useState<string>();
   const [revoking, setRevoking] = useState(false);
   const [url, setUrl] = useState("http://127.0.0.1:3774");
   const [token, setToken] = useState("");
@@ -140,11 +144,18 @@ export function ConnectionsSettings() {
               if (update)
                 label =
                   "Connected · host update needed for Explorer and Changes";
-              if (!disposed)
+              if (!disposed) {
                 setNeedsUpdate((current) => ({
                   ...current,
                   [machine.id]: update,
                 }));
+                setSetupProviders((current) => ({
+                  ...current,
+                  [machine.id]: host.capabilities?.includes("agents.inventory")
+                    ? host.providers.filter((provider) => INVENTORY_PROVIDERS.includes(provider))
+                    : [],
+                }));
+              }
             } catch {
               label = "Offline · reconnect to check access";
             }
@@ -308,6 +319,17 @@ export function ConnectionsSettings() {
                     </button>
                   </div>
                 )}
+                {setupProviders[machine.id]?.length ? (
+                  <button
+                    className={button}
+                    aria-expanded={setupOpen === machine.id}
+                    onClick={() =>
+                      setSetupOpen((current) => (current === machine.id ? undefined : machine.id))
+                    }
+                  >
+                    Agent setup
+                  </button>
+                ) : null}
                 <button
                   disabled={busy || revoking}
                   className="rounded p-2 text-content/40 hover:bg-selection hover:text-content disabled:opacity-40"
@@ -321,6 +343,9 @@ export function ConnectionsSettings() {
                   <Trash2 className="size-4" />
                 </button>
               </div>
+              {setupOpen === machine.id && setupProviders[machine.id]?.length ? (
+                <AgentSetupPanel machine={machine} providers={setupProviders[machine.id]!} />
+              ) : null}
               {removing === machine.id && (
                 <div
                   role="group"

@@ -36,17 +36,40 @@ const server = http.createServer((req, res) => {
     res.end('[]');
     return;
   }
+  const emit = (text) => setTimeout(() => {
+    const id = 'msg' + Math.random();
+    const events = [
+      {type: 'message.updated', properties: {info: {sessionID: 'fixture_open', id, role: 'assistant'}}},
+      {type: 'message.part.updated', properties: {part: {sessionID: 'fixture_open', id: 'part' + id, messageID: id, type: 'text', text}}},
+      {type: 'session.status', properties: {sessionID: 'fixture_open', status: {type: 'idle'}}},
+    ];
+    for (const subscriber of subscribers) for (const event of events)
+      subscriber.write('data: ' + JSON.stringify(event) + '\\n\\n');
+  }, 30);
+  if (path === '/command') {
+    res.writeHead(200, {'Content-Type': 'application/json'});
+    res.end(JSON.stringify([{name: 'review', description: 'Review changes', source: 'command'}]));
+    return;
+  }
+  if (path === '/session/fixture_open/command') {
+    let body = '';
+    req.on('data', (chunk) => body += chunk);
+    req.on('end', () => {
+      const input = JSON.parse(body);
+      emit('Command ran: ' + input.command + ' ' + input.arguments + ' with ' + input.model);
+      // Like OpenCode, answer only once the command's turn is over.
+      setTimeout(() => { res.writeHead(200, {'Content-Type': 'application/json'}); res.end('{}'); }, 60);
+    });
+    return;
+  }
   if (path === '/session/fixture_open/prompt_async') {
-    res.writeHead(204); res.end();
-    setTimeout(() => {
-      const events = [
-        {type: 'message.updated', properties: {info: {sessionID: 'fixture_open', id: 'msg', role: 'assistant'}}},
-        {type: 'message.part.updated', properties: {part: {sessionID: 'fixture_open', id: 'part', messageID: 'msg', type: 'text', text: 'Headless OpenCode completed'}}},
-        {type: 'session.status', properties: {sessionID: 'fixture_open', status: {type: 'idle'}}},
-      ];
-      for (const subscriber of subscribers) for (const event of events)
-        subscriber.write('data: ' + JSON.stringify(event) + '\\n\\n');
-    }, 30);
+    let body = '';
+    req.on('data', (chunk) => body += chunk);
+    req.on('end', () => {
+      res.writeHead(204); res.end();
+      const text = JSON.parse(body).parts?.[0]?.text ?? '';
+      emit(text.startsWith('/') ? 'Prompted: ' + text : 'Headless OpenCode completed');
+    });
     return;
   }
   res.writeHead(204); res.end();
@@ -101,4 +124,23 @@ it("runs an OpenCode session through the host HTTP and SSE bridge", async () => 
   const state = store.session(sessionId).session;
   expect(state.blocks.at(-1)?.text).toContain("Headless OpenCode completed");
   expect(state.providerSessionId).toBe("fixture_open");
+});
+
+it("runs OpenCode commands through its command endpoint and sends other slash text as a prompt", async () => {
+  const project = await engine.openProject(directory);
+  const { sessionId } = engine.command({
+    type: "create",
+    commandId: "create-opencode-command",
+    projectId: project.id,
+    harness: "opencode",
+    model: "opencode:openai/fixture-model",
+    runtimeMode: "supervised",
+  });
+  engine.command({ type: "send", commandId: "send-command", sessionId, text: "/review src/app" });
+  await vi.waitFor(() => expect(store.session(sessionId).session.blocks.at(-1)?.text)
+    .toContain("Command ran: review src/app with openai/fixture-model"), { timeout: 8_000 });
+  await vi.waitFor(() => expect(store.session(sessionId).status).toBe("idle"), { timeout: 8_000 });
+  engine.command({ type: "send", commandId: "send-unknown", sessionId, text: "/nope keep" });
+  await vi.waitFor(() => expect(store.session(sessionId).session.blocks.at(-1)?.text)
+    .toContain("Prompted: /nope keep"), { timeout: 8_000 });
 });

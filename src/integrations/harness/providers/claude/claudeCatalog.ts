@@ -318,18 +318,33 @@ async function discoverViaListModels(
 }
 
 export type ClaudeCommand = { name: string; description: string };
+export type ClaudeMcpServer = { name: string; status: string; scope: string; tools: number };
 
-/** Skills, plugin skills and commands exactly as Claude Code sees them in `cwd`, from `initialize`. */
-export async function discoverClaudeCommands(cwd: string): Promise<ClaudeCommand[]> {
+/**
+ * Spawn Claude Code with the user's settings, send `initialize`, and let `step` read control
+ * responses and send more control requests. Nothing is prompted, so no turn runs.
+ */
+async function claudeControlProbe<T>(
+  cwd: string,
+  step: (
+    response: NonNullable<ReturnType<typeof parseControlResponse>>,
+    send: (requestId: string, subtype: string) => void,
+    done: (value: T) => void,
+  ) => void,
+): Promise<T> {
   const { path } = await resolveClaudeBinary();
   const sessionId = crypto.randomUUID();
-  const probeId = `${PROBE_ID}-commands-${sessionId}`;
-  let done: ((commands: ClaudeCommand[]) => void) | null = null;
+  const probeId = `${PROBE_ID}-control-${sessionId}`;
+  let done: ((value: T) => void) | null = null;
   let failed: ((error: Error) => void) | null = null;
-  const pending = new Promise<ClaudeCommand[]>((resolve, reject) => {
+  const pending = new Promise<T>((resolve, reject) => {
     done = resolve;
     failed = reject;
   });
+  const send = (requestId: string, subtype: string) => {
+    void writeChild(probeId, JSON.stringify(buildControlRequest(requestId, { subtype })))
+      .catch((error: unknown) => failed?.(error instanceof Error ? error : new Error(String(error))));
+  };
   const stop = async () => {
     unwatchChild(probeId);
     await killChild(probeId).catch(() => undefined);
@@ -338,21 +353,15 @@ export async function discoverClaudeCommands(cwd: string): Promise<ClaudeCommand
     probeId,
     (line) => {
       const rec = parseJsonLine(line);
-      const init = rec && parseControlResponse(rec);
-      if (!init || init.requestId !== INIT_REQUEST_ID) return;
-      if (!init.ok) return failed?.(new Error(init.error ?? "Claude Code initialize failed"));
-      const rows = Array.isArray(init.payload?.commands) ? init.payload.commands : [];
-      done?.(rows.flatMap((row) => {
-        const name = stringField(asRecord(row), "name");
-        return name
-          ? [{ name, description: stringField(asRecord(row), "description") ?? "" }]
-          : [];
-      }));
+      const response = rec && parseControlResponse(rec);
+      if (!response) return;
+      if (!response.ok) return failed?.(new Error(response.error ?? "Claude Code control request failed"));
+      step(response, send, (value) => done?.(value));
     },
-    () => failed?.(new Error("Claude Code command probe exited")),
+    () => failed?.(new Error("Claude Code control probe exited")),
   );
   try {
-    // Not isolated: the user's skills, plugins and settings must load. Nothing is sent, so no turn runs.
+    // Not isolated: the user's skills, plugins, MCP servers and settings must load.
     await spawnChild(
       probeId,
       path,
@@ -361,16 +370,52 @@ export async function discoverClaudeCommands(cwd: string): Promise<ClaudeCommand
       undefined,
       "claude",
     );
-    await writeChild(
-      probeId,
-      JSON.stringify(buildControlRequest(INIT_REQUEST_ID, { subtype: "initialize" })),
-    );
+    send(INIT_REQUEST_ID, "initialize");
     return await withTimeout(DISCOVERY_TIMEOUT_MS, pending, () => {
       void stop();
     });
   } finally {
     await stop();
   }
+}
+
+/** Skills, plugin skills and commands exactly as Claude Code sees them in `cwd`. */
+export function discoverClaudeCommands(cwd: string): Promise<ClaudeCommand[]> {
+  return claudeControlProbe(cwd, (response, _send, done) => {
+    if (response.requestId !== INIT_REQUEST_ID) return;
+    const rows = Array.isArray(response.payload?.commands) ? response.payload.commands : [];
+    done(rows.flatMap((row) => {
+      const name = stringField(asRecord(row), "name");
+      return name ? [{ name, description: stringField(asRecord(row), "description") ?? "" }] : [];
+    }));
+  });
+}
+
+const MCP_STATUS_REQUEST_ID = "monocode_mcp_status";
+const MCP_SETTLE_MS = 8_000;
+
+/** MCP servers Claude Code loads in `cwd`, polled until none is still connecting (or ~8 s). */
+export function discoverClaudeMcp(cwd: string): Promise<ClaudeMcpServer[]> {
+  const started = Date.now();
+  return claudeControlProbe(cwd, (response, send, done) => {
+    if (response.requestId === INIT_REQUEST_ID) return send(MCP_STATUS_REQUEST_ID, "mcp_status");
+    if (response.requestId !== MCP_STATUS_REQUEST_ID) return;
+    const rows = (Array.isArray(response.payload?.mcpServers) ? response.payload.mcpServers : [])
+      .flatMap((row) => {
+        const rec = asRecord(row);
+        const name = stringField(rec, "name");
+        // Only names and states: configs can carry URLs with keys and auth headers.
+        return name ? [{
+          name,
+          status: stringField(rec, "status") ?? "unknown",
+          scope: stringField(rec, "scope") ?? "",
+          tools: Array.isArray(rec?.tools) ? rec.tools.length : 0,
+        }] : [];
+      });
+    if (rows.some((row) => row.status === "pending") && Date.now() - started < MCP_SETTLE_MS)
+      setTimeout(() => send(MCP_STATUS_REQUEST_ID, "mcp_status"), 700);
+    else done(rows);
+  });
 }
 
 async function discoverViaVersion(

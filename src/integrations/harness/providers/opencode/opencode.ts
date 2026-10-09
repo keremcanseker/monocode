@@ -574,13 +574,35 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   settlePendingTurn(live);
 
   try {
-    await live.client.promptAsync({
-      sessionID: live.openCodeSessionId,
-      model: parsed,
-      agent: openCodeAgentForTurn(input),
-      variant: input.modelSettings?.variant,
-      parts,
-    });
+    const slash = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(input.text.trim());
+    const isCommand =
+      !!slash &&
+      (await live.client.commands().catch(() => [])).some((row) => row.name === slash[1]);
+    if (slash && isCommand) {
+      // OpenCode only expands `/name` through its command endpoint; plain prompts reach the model verbatim.
+      void live.client
+        .command({
+          sessionID: live.openCodeSessionId,
+          model: `${parsed.providerID}/${parsed.modelID}`,
+          agent: openCodeAgentForTurn(input),
+          variant: input.modelSettings?.variant,
+          command: slash[1]!,
+          arguments: slash[2] ?? "",
+          parts: parts.filter((part) => part.type === "file"),
+        })
+        .catch((error: unknown) => {
+          // A long command outlives the HTTP wait; only OpenCode's own rejection ends the turn.
+          if (error instanceof OpenCodeHttpError) live.turnFailed?.(error);
+        });
+    } else {
+      await live.client.promptAsync({
+        sessionID: live.openCodeSessionId,
+        model: parsed,
+        agent: openCodeAgentForTurn(input),
+        variant: input.modelSettings?.variant,
+        parts,
+      });
+    }
     input.onAccepted?.();
     settlePendingTurn(live);
     await turnPromise;

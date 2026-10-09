@@ -137,6 +137,38 @@ export class OpenCodeClient {
     );
   }
 
+  /** Commands and skills OpenCode can run with `/name` in this directory. */
+  async commands(): Promise<Array<{ name: string; description?: string; source?: string }>> {
+    const rows = await this.request<unknown>("GET", "/command");
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  /**
+   * Run an OpenCode command. The response arrives only when the turn ends, so callers follow
+   * the event stream for progress and completion rather than this promise.
+   */
+  async command(input: {
+    sessionID: string;
+    model: string;
+    agent?: string;
+    variant?: string;
+    command: string;
+    arguments: string;
+    parts: Array<Extract<OpenCodePromptPart, { type: "file" }>>;
+  }): Promise<unknown> {
+    return this.request("POST", `/session/${enc(input.sessionID)}/command`, {
+      body: {
+        command: input.command,
+        arguments: input.arguments,
+        model: input.model,
+        ...(input.agent ? { agent: input.agent } : {}),
+        ...(input.variant ? { variant: input.variant } : {}),
+        ...(input.parts.length ? { parts: input.parts } : {}),
+      },
+      timeoutMs: 24 * 60 * 60_000,
+    });
+  }
+
   async prompt(input: {
     sessionID: string;
     model: { providerID: string; modelID: string };

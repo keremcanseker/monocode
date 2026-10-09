@@ -40,7 +40,7 @@ import {
   writeHostFile,
 } from "./workspace";
 import { WorkspaceCommands } from "./workspace-commands";
-import { listHostSkills } from "./skills";
+import { hostInventory, listHostSkills } from "./skills";
 import { discoverCodexModels } from "../src/integrations/harness/providers/codex/codexCatalog";
 import { discoverClaudeModels } from "../src/integrations/harness/providers/claude/claudeCatalog";
 import { discoverCursorModels } from "../src/integrations/harness/providers/cursor/cursorCatalog";
@@ -238,6 +238,7 @@ export function createHostServer(
                 "sessions.draft",
                 "sessions.plan",
                 "skills.list",
+                "agents.inventory",
               ],
             };
             break;
@@ -253,10 +254,20 @@ export function createHostServer(
           case "models.list":
             result = await models(params.projectId);
             break;
+          case "agents.inventory": {
+            const provider = params.provider as RemoteProvider;
+            if (!providers.includes(provider)) throw new Error("Unsupported provider");
+            result = await hostInventory(provider, homedir());
+            break;
+          }
           case "skills.list": {
             const provider = params.provider as RemoteProvider;
             if (!providers.includes(provider)) throw new Error("Unsupported provider");
-            result = await listHostSkills(provider, engine.store.project(String(params.projectId ?? "")).cwd);
+            // Without a project (machine settings), list what the provider sees from the home folder.
+            const cwd = typeof params.projectId === "string"
+              ? engine.store.project(params.projectId).cwd
+              : homedir();
+            result = await listHostSkills(provider, cwd);
             break;
           }
           case "sessions.list": {
