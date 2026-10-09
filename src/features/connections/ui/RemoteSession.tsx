@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import type { Skill } from "../../skills/model/skills";
 import type { SessionPaneProps } from "../../sessions/ui/SessionPane";
 import type {
   Attachment,
@@ -61,7 +62,7 @@ import {
 
 export type RemoteSessionOverrides = Partial<SessionPaneProps> & {
   remoteSession: boolean;
-  remoteFeatures: { attachments: boolean; plan: boolean; draft: boolean };
+  remoteFeatures: { attachments: boolean; plan: boolean; draft: boolean; skills: Skill[] };
   remoteSessionLoading: boolean;
   remoteSessionStarted: boolean;
   allowedModelHarnesses: readonly HarnessId[];
@@ -492,6 +493,30 @@ function ConnectedRemoteSession({
     mode: hostSession.runtimeMode,
   };
   const configuration = saved ? (changes ?? saved) : draft;
+
+  // Skills and commands as the host's provider sees them, for the `/` menu.
+  const [hostSkills, setHostSkills] = useState<Skill[]>([]);
+  const skillsHarness = configuration.harness;
+  useEffect(() => {
+    setHostSkills([]);
+    if (!descriptor?.capabilities.includes("skills.list")) return;
+    let disposed = false;
+    void remoteRequest<Array<{ name: string; description: string }>>(machine.id, "skills.list", {
+      projectId: project.projectId,
+      provider: skillsHarness,
+    })
+      .then((rows) => {
+        if (!disposed)
+          setHostSkills(rows.map((row) => ({
+            kind: "native", name: row.name, description: row.description,
+            invocation: row.name, source: skillsHarness,
+          })));
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+    };
+  }, [machine.id, descriptor?.environmentId, project.projectId, skillsHarness]);
   const updateConfiguration = (
     update: (current: Configuration) => Configuration,
   ) => {
@@ -1177,6 +1202,7 @@ function ConnectedRemoteSession({
       attachments: !!descriptor?.capabilities.includes("attachments.upload"),
       plan: !!descriptor?.capabilities.includes("sessions.plan"),
       draft: !!descriptor?.capabilities.includes("sessions.draft"),
+      skills: hostSkills,
     },
     remoteSessionLoading: !!sessionId && !hostSession && !session.blocks.length,
     remoteSessionStarted: !!sessionId,

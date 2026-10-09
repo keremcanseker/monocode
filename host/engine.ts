@@ -3,6 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { basename, isAbsolute } from "node:path";
 import { renameHostWorktreeBranch, resolveHostWorktree } from "./git-worktrees";
+import { withHermesSkills } from "./skills";
 import {
   applyHarnessEvent,
   stopStreaming,
@@ -799,7 +800,7 @@ export class HostEngine {
             else
               await provider.send({
                 ...input,
-                text: prompt,
+                text: session.harness === "hermes" ? withHermesSkills(prompt) : prompt,
                 attachments: attachments?.map((file) =>
                   isVisionImage(file.mimeType) &&
                   file.path &&

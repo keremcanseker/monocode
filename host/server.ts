@@ -40,6 +40,7 @@ import {
   writeHostFile,
 } from "./workspace";
 import { WorkspaceCommands } from "./workspace-commands";
+import { listHostSkills } from "./skills";
 import { discoverCodexModels } from "../src/integrations/harness/providers/codex/codexCatalog";
 import { discoverClaudeModels } from "../src/integrations/harness/providers/claude/claudeCatalog";
 import { discoverCursorModels } from "../src/integrations/harness/providers/cursor/cursorCatalog";
@@ -236,6 +237,7 @@ export function createHostServer(
                 "attachments.read",
                 "sessions.draft",
                 "sessions.plan",
+                "skills.list",
               ],
             };
             break;
@@ -251,6 +253,12 @@ export function createHostServer(
           case "models.list":
             result = await models(params.projectId);
             break;
+          case "skills.list": {
+            const provider = params.provider as RemoteProvider;
+            if (!providers.includes(provider)) throw new Error("Unsupported provider");
+            result = await listHostSkills(provider, engine.store.project(String(params.projectId ?? "")).cwd);
+            break;
+          }
           case "sessions.list": {
             const projectId = String(params.projectId ?? "");
             const project = engine.store.project(projectId);

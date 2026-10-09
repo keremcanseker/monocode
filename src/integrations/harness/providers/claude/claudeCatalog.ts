@@ -317,6 +317,62 @@ async function discoverViaListModels(
   }
 }
 
+export type ClaudeCommand = { name: string; description: string };
+
+/** Skills, plugin skills and commands exactly as Claude Code sees them in `cwd`, from `initialize`. */
+export async function discoverClaudeCommands(cwd: string): Promise<ClaudeCommand[]> {
+  const { path } = await resolveClaudeBinary();
+  const sessionId = crypto.randomUUID();
+  const probeId = `${PROBE_ID}-commands-${sessionId}`;
+  let done: ((commands: ClaudeCommand[]) => void) | null = null;
+  let failed: ((error: Error) => void) | null = null;
+  const pending = new Promise<ClaudeCommand[]>((resolve, reject) => {
+    done = resolve;
+    failed = reject;
+  });
+  const stop = async () => {
+    unwatchChild(probeId);
+    await killChild(probeId).catch(() => undefined);
+  };
+  watchChild(
+    probeId,
+    (line) => {
+      const rec = parseJsonLine(line);
+      const init = rec && parseControlResponse(rec);
+      if (!init || init.requestId !== INIT_REQUEST_ID) return;
+      if (!init.ok) return failed?.(new Error(init.error ?? "Claude Code initialize failed"));
+      const rows = Array.isArray(init.payload?.commands) ? init.payload.commands : [];
+      done?.(rows.flatMap((row) => {
+        const name = stringField(asRecord(row), "name");
+        return name
+          ? [{ name, description: stringField(asRecord(row), "description") ?? "" }]
+          : [];
+      }));
+    },
+    () => failed?.(new Error("Claude Code command probe exited")),
+  );
+  try {
+    // Not isolated: the user's skills, plugins and settings must load. Nothing is sent, so no turn runs.
+    await spawnChild(
+      probeId,
+      path,
+      [...buildClaudeSpawnArgs({ sessionId }), "--no-session-persistence"],
+      cwd,
+      undefined,
+      "claude",
+    );
+    await writeChild(
+      probeId,
+      JSON.stringify(buildControlRequest(INIT_REQUEST_ID, { subtype: "initialize" })),
+    );
+    return await withTimeout(DISCOVERY_TIMEOUT_MS, pending, () => {
+      void stop();
+    });
+  } finally {
+    await stop();
+  }
+}
+
 async function discoverViaVersion(
   workingDirectory?: string,
 ): Promise<AgentModel[]> {

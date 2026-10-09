@@ -205,7 +205,7 @@ type Props = {
   hideTopBar?: boolean;
   /** Keeps local file mentions, skills, and app modes off for host sessions. */
   remoteSession?: boolean;
-  remoteFeatures?: { attachments: boolean; plan: boolean; draft: boolean };
+  remoteFeatures?: { attachments: boolean; plan: boolean; draft: boolean; skills?: Skill[] };
   context?: ContextUsage;
   compactSupported?: boolean;
   quoteRequest?: QuoteRequest;
@@ -677,7 +677,13 @@ export function Composer({
   const slashItems = useMemo(
     () =>
       remote
-        ? [...(remoteFeatures?.plan ? [PLAN_COMMAND] : []), COMPACT_COMMAND]
+        ? [
+            ...(remoteFeatures?.plan ? [PLAN_COMMAND] : []),
+            COMPACT_COMMAND,
+            ...(remoteFeatures?.skills ?? []).filter(
+              (skill) => skill.name !== PLAN_COMMAND.name && skill.name !== COMPACT_COMMAND.name,
+            ),
+          ]
         : [
             SESSION_FOLDER_COMMAND,
             OPERATOR_COMMAND,
@@ -696,7 +702,7 @@ export function Composer({
                     skill.name !== BTW_COMMAND.name)),
             ),
           ],
-    [harness, skills, remote, remoteFeatures?.plan],
+    [harness, skills, remote, remoteFeatures?.plan, remoteFeatures?.skills],
   );
   const skillLimit = hasNativeCommands(harness)
     ? Number.POSITIVE_INFINITY
