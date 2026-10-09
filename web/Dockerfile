@@ -18,7 +18,7 @@ RUN git clone --depth 1 --branch "$HERMES_VERSION" https://github.com/NousResear
  && test "$(git -C /opt/hermes rev-parse HEAD)" = "$HERMES_COMMIT" \
  && rm -rf /opt/hermes/.git \
  && cd /opt/hermes \
- && UV_PYTHON=/usr/bin/python3 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy uv sync --frozen --no-dev --extra acp \
+ && UV_PYTHON=/usr/bin/python3 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy uv sync --frozen --no-dev --extra acp --extra mcp \
  && printf 'docker\n' > .install_method
 
 FROM node:24.21.0-bookworm-slim
@@ -38,6 +38,13 @@ RUN npm install -g --allow-scripts=@anthropic-ai/claude-code,opencode-ai \
  && claude --version | grep -q "^${CLAUDE_CODE_VERSION}" \
  && opencode --version | grep -qx "${OPENCODE_VERSION}" \
  && npm cache clean --force
+# Playwright MCP gives agents a real browser; Chromium and its system libraries go in the image,
+# outside the volume, at the Playwright version this MCP release was built against.
+ARG PLAYWRIGHT_MCP_VERSION=0.0.83
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN npm install -g @playwright/mcp@${PLAYWRIGHT_MCP_VERSION} \
+ && node /usr/local/lib/node_modules/@playwright/mcp/node_modules/playwright/cli.js install --with-deps chromium \
+ && rm -rf /var/lib/apt/lists/* && npm cache clean --force
 COPY --from=hermes /opt/hermes /opt/hermes
 RUN ln -s /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes \
  && HERMES_HOME=/tmp/hermes-check hermes --version && rm -rf /tmp/hermes-check
