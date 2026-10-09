@@ -22,6 +22,10 @@ fi
 mkdir -p "$HOME/.hermes"
 grep -qs '^HERMES_COPILOT_ACP_COMMAND=' "$HOME/.hermes/.env" ||
   printf 'HERMES_COPILOT_ACP_COMMAND=claude-agent-acp\n' >>"$HOME/.hermes/.env"
+# Hermes' default args contain --acp, so it probes `--help` for that flag; claude-agent-acp prints
+# nothing there and gets refused. It ignores --stdio, which skips the probe.
+grep -qs '^HERMES_COPILOT_ACP_ARGS=' "$HOME/.hermes/.env" ||
+  printf 'HERMES_COPILOT_ACP_ARGS=--stdio\n' >>"$HOME/.hermes/.env"
 if [ ! -e "$HOME/.hermes/config.yaml" ]; then
   { hermes config set model.provider copilot-acp && hermes config set model.default copilot-acp; } >/dev/null ||
     echo "MonoCode web: could not set Hermes' default model" >&2
