@@ -18,7 +18,7 @@ RUN git clone --depth 1 --branch "$HERMES_VERSION" https://github.com/NousResear
  && test "$(git -C /opt/hermes rev-parse HEAD)" = "$HERMES_COMMIT" \
  && rm -rf /opt/hermes/.git \
  && cd /opt/hermes \
- && UV_PYTHON=/usr/bin/python3 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy uv sync --frozen --no-dev --extra acp --extra mcp \
+ && UV_PYTHON=/usr/bin/python3 UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy uv sync --frozen --no-dev --extra acp --extra mcp --extra messaging \
  && printf 'docker\n' > .install_method
 
 FROM node:24.21.0-bookworm-slim
