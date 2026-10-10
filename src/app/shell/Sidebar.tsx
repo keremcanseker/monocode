@@ -2152,6 +2152,7 @@ function SidebarComponent({
 
   return (
     <div
+      data-phone-drawer
       className={`flex h-full shrink-0 ${
         railVisible || compactRailVisible || sidebarVisible ? "" : "hidden"
       }`}

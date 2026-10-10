@@ -1,4 +1,5 @@
 import { acceptQuickLaunch } from "./model/quickLaunchSession";
+import { isPhoneWeb, usePhoneWeb } from "../shared/hooks/usePhoneWeb";
 import {
   cancelScheduledFlush,
   scheduleHarnessFlush,
@@ -963,10 +964,22 @@ export default function App({
     (id: string) => tabProjectsRef.current.get(id),
     [],
   );
-  const [projectRailOpen, setProjectRailOpen] = useState(loadProjectRailOpen);
-  const [sessionSidebarOpen, setSessionSidebarOpen] = useState(
-    loadSessionSidebarOpen,
+  // On a phone the rail and sidebar are one drawer over the session, closed at start.
+  const phoneWeb = usePhoneWeb();
+  const [projectRailOpen, setProjectRailOpen] = useState(
+    () => !isPhoneWeb() && loadProjectRailOpen(),
   );
+  const [sessionSidebarOpen, setSessionSidebarOpen] = useState(
+    () => !isPhoneWeb() && loadSessionSidebarOpen(),
+  );
+  const setPhoneDrawer = useCallback((open: boolean) => {
+    setProjectRailOpen(open);
+    setSessionSidebarOpen(open);
+  }, []);
+  // Picking or starting a session on a phone shows it instead of the drawer.
+  useEffect(() => {
+    if (isPhoneWeb()) setPhoneDrawer(false);
+  }, [activeTabId, setPhoneDrawer]);
   const tabCloseScope = "project" as const;
   const currentProjectDock = findProjectTerminal(projectTerminals, projectCwd);
   const dockVisible = !!currentProjectDock?.open;
@@ -9658,28 +9671,31 @@ export default function App({
   );
 
   const onToggleSidebar = useCallback(() => {
+    if (isPhoneWeb()) return setPhoneDrawer(!(projectRailOpen || sessionSidebarOpen));
     setProjectRailOpen((open) => {
       const next = !open;
       saveProjectRailOpen(next);
       return next;
     });
-  }, []);
+  }, [projectRailOpen, sessionSidebarOpen, setPhoneDrawer]);
 
   const onToggleSessionSidebar = useCallback(() => {
+    if (isPhoneWeb()) return setPhoneDrawer(!(projectRailOpen || sessionSidebarOpen));
     setSessionSidebarOpen((open) => {
       const next = !open;
       saveSessionSidebarOpen(next);
       return next;
     });
-  }, []);
+  }, [projectRailOpen, sessionSidebarOpen, setPhoneDrawer]);
 
   const onToggleProjectRail = useCallback(() => {
+    if (isPhoneWeb()) return setPhoneDrawer(!(projectRailOpen || sessionSidebarOpen));
     setProjectRailOpen((open) => {
       const next = !open;
       saveProjectRailOpen(next);
       return next;
     });
-  }, []);
+  }, [projectRailOpen, sessionSidebarOpen, setPhoneDrawer]);
 
   const onGoToFile = useCallback(() => {
     setSearchViewOpen(false);
@@ -10605,7 +10621,8 @@ export default function App({
     inboxViewOpen ||
     notesViewOpen ||
     automationsViewOpen;
-  const compactProjectRail = collapsedProjectRailMode === "compact";
+  // The phone drawer replaces the collapsed icon rail.
+  const compactProjectRail = !phoneWeb && collapsedProjectRailMode === "compact";
   const compactRailActive = compactProjectRail && !projectRailOpen;
   const compactTitleBar = IS_MAC && compactRailActive && !chromeSurfaceOpen;
   const workspaceTitleBar = (
@@ -10652,6 +10669,13 @@ export default function App({
         >
           {compactTitleBar ? workspaceTitleBar : null}
           <div className="flex min-h-0 min-w-0 flex-1">
+            {phoneWeb && (projectRailOpen || sessionSidebarOpen) ? (
+              <div
+                aria-hidden
+                className="fixed inset-0 z-40 bg-black/50"
+                onClick={() => setPhoneDrawer(false)}
+              />
+            ) : null}
             <Sidebar
               cwd={sidebarCwd}
               gitCwd={gitCwd}
