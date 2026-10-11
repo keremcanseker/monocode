@@ -362,12 +362,24 @@ export function useRemoteMachineOnline(machineId?: string): boolean | undefined 
 
 const historyKey = (project: string) => `monocode.remote-history.v2:${project}`;
 
+// Tab titles and icons read this on every render, once per remote session;
+// parse each stored list once, until the host sends a new one.
+const parsedHistory = new Map<
+  string,
+  { raw: string | null; sessions: HostSessionSummary[] }
+>();
+
 function cachedSessions(project: string): HostSessionSummary[] {
   try {
-    const value: unknown = JSON.parse(
-      localStorage.getItem(historyKey(project)) ?? "[]",
-    );
-    return Array.isArray(value) ? (value as HostSessionSummary[]) : [];
+    const raw = localStorage.getItem(historyKey(project));
+    const hit = parsedHistory.get(project);
+    if (hit && hit.raw === raw) return hit.sessions;
+    const value: unknown = JSON.parse(raw ?? "[]");
+    const sessions = Array.isArray(value)
+      ? (value as HostSessionSummary[])
+      : [];
+    parsedHistory.set(project, { raw, sessions });
+    return sessions;
   } catch {
     return [];
   }

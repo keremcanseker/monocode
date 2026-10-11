@@ -1598,12 +1598,16 @@ export default function App({
     }
     return [];
   }, [active?.harness]);
+  // A remote conversation's local shell keeps the default harness and model.
+  const activeRemote = active ? remoteSummary(active) : undefined;
+  const usageHarness = activeRemote?.harness ?? active?.harness;
+  const usageModel = activeRemote?.model ?? active?.model;
   const usageSession = useMemo(() => {
-    if (!active) return undefined;
+    if (!active || !usageHarness) return undefined;
     return {
       id: active.id,
-      harness: active.harness,
-      model: active.model,
+      harness: usageHarness,
+      model: usageModel ?? "",
       authRequired: latestTurnNeedsHarnessLogin(active.blocks),
       providerAccountId:
         active.providerAccountId ??
@@ -1611,7 +1615,7 @@ export default function App({
           ? DEFAULT_PROVIDER_ACCOUNT_ID
           : undefined),
     };
-  }, [active?.id, active?.harness, active?.model, active?.blocks, active?.providerAccountId]);
+  }, [active?.id, usageHarness, usageModel, active?.blocks, active?.providerAccountId]);
   const activeProviderSignInRequest = useMemo(() => {
     if (
       !active ||
@@ -11196,13 +11200,21 @@ export default function App({
     </OrchestrationActions.Provider>
   );
 }
-function conversationTitle(session: Session): string {
+/** What the host last listed for a remote conversation's local shell. */
+function remoteSummary(session: Session) {
   const hostId = isRemoteProjectPath(session.cwd)
     ? remoteSessionFor(session.id)
     : undefined;
-  const remote = hostId
-    ? cachedRemoteSessionSummary(session.cwd, hostId)
-    : undefined;
+  return hostId ? cachedRemoteSessionSummary(session.cwd, hostId) : undefined;
+}
+
+/** A remote shell starts on the default harness; the host knows the real one. */
+function displayHarness(session: Session): HarnessId {
+  return remoteSummary(session)?.harness ?? session.harness;
+}
+
+function conversationTitle(session: Session): string {
+  const remote = remoteSummary(session);
   const title = sessionDisplayTitle(
     remote?.title ?? session.title,
     remote?.harness ?? session.harness,
@@ -11286,21 +11298,18 @@ function toTitleTab(
     ? [focused, ...tabSessions.filter((session) => session.id !== focused.id)]
     : tabSessions;
   for (const session of ordered) {
-    if (
-      session.busy &&
-      !sessionNeedsInput(session) &&
-      !busySeen.has(session.harness)
-    ) {
-      busySeen.add(session.harness);
-      busyHarnesses.push(session.harness);
+    const harness = displayHarness(session);
+    if (session.busy && !sessionNeedsInput(session) && !busySeen.has(harness)) {
+      busySeen.add(harness);
+      busyHarnesses.push(harness);
     }
-    if (unseenFinishedIds.has(session.id) && !doneSeen.has(session.harness)) {
-      doneSeen.add(session.harness);
-      doneHarnesses.push(session.harness);
+    if (unseenFinishedIds.has(session.id) && !doneSeen.has(harness)) {
+      doneSeen.add(harness);
+      doneHarnesses.push(harness);
     }
-    if (seen.has(session.harness)) continue;
-    seen.add(session.harness);
-    harnesses.push(session.harness);
+    if (seen.has(harness)) continue;
+    seen.add(harness);
+    harnesses.push(harness);
   }
 
   const files: string[] = [];
