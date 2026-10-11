@@ -314,8 +314,10 @@ function ConnectedRemoteSession({
     online,
   );
   const activeSessionId = hostSession?.id ?? sessionId;
+  // A steer the turn could not take waits in the host queue under its ID.
   const hasHostBlock = (commandId: string) =>
-    !!hostSession?.blocks.some((block) => block.id === commandId);
+    !!hostSession?.blocks.some((block) => block.id === commandId) ||
+    !!hostSession?.queuedMessages?.some((message) => message.id === commandId);
   const unseenActive =
     !!unseenSend &&
     unseenSend.sessionId === activeSessionId &&
@@ -329,6 +331,10 @@ function ConnectedRemoteSession({
   const busy =
     !!hostSession?.busy || unseenActive || (startingActive && !starting?.draft) || pendingSendActive;
   const queueSupported = !!descriptor?.capabilities.includes("sessions.queue");
+  // Providers whose running turn takes a follow-up on the host.
+  const steerable =
+    !!descriptor?.capabilities.includes("sessions.steer") &&
+    (hostSession?.harness === "claude" || hostSession?.harness === "codex");
   const configureRunning = !!descriptor?.capabilities.includes(
     "sessions.configureRunning",
   );
@@ -352,7 +358,7 @@ function ConnectedRemoteSession({
     if (
       unseenSend &&
       hostSession?.id === unseenSend.sessionId &&
-      hostSession.blocks.some((block) => block.id === unseenSend.commandId)
+      hasHostBlock(unseenSend.commandId)
     )
       setUnseenSend((current) =>
         current?.commandId === unseenSend.commandId ? undefined : current,
@@ -576,14 +582,20 @@ function ConnectedRemoteSession({
     sendingRef.current = true;
     setSending(true);
     setError("");
-    if (command.type === "send" || command.type === "compact")
+    // A steered message shows in the transcript at once, as locally.
+    const shown =
+      command.type === "send" ||
+      command.type === "compact" ||
+      (command.type === "steer" && command.text !== undefined);
+    if (shown)
       setUnseenSend((current) =>
         current?.commandId === command.commandId
           ? current
           : {
               sessionId: command.sessionId,
               commandId: command.commandId,
-              text: command.type === "send" ? command.text : "/compact",
+              text:
+                command.type === "compact" ? "/compact" : (command.text ?? ""),
               attachments: optimistic?.attachments ?? [],
               startedAt: optimistic?.startedAt ?? Date.now(),
               turnModel: optimistic?.turnModel ?? selectedTurnModel(),
@@ -651,7 +663,7 @@ function ConnectedRemoteSession({
       if (!alive.current || version !== bindingVersion.current) return undefined;
       const message = String(reason);
       if (message.includes("Host rejected request:")) {
-        if (command.type === "send" || command.type === "compact")
+        if (shown)
           setUnseenSend((current) =>
             current?.commandId === command.commandId ? undefined : current,
           );
@@ -851,13 +863,15 @@ function ConnectedRemoteSession({
     }
   };
 
-  // The host holds follow-ups sent during a turn and sends each in order.
+  // A follow-up sent during a turn goes into it where the provider can take
+  // one (steer), as locally; otherwise the host queues it for after the turn.
   const enqueue = (
     id: string,
     text: string,
     attachments: Attachment[],
     intent: "default" | "plan" | "build",
     onRejected?: () => void,
+    steer = false,
   ): boolean => {
     const version = bindingVersion.current;
     const commandId = crypto.randomUUID();
@@ -865,14 +879,18 @@ function ConnectedRemoteSession({
     void uploadRemoteAttachments(machine.id, attachments)
       .then((refs) => {
         if (!alive.current || version !== bindingVersion.current) return;
-        return run({
-          type: "enqueue",
-          commandId,
-          sessionId: id,
-          text,
-          attachments: refs,
-          intent,
-        });
+        return run(
+          steer
+            ? { type: "steer", commandId, sessionId: id, text, attachments: refs }
+            : {
+                type: "enqueue",
+                commandId,
+                sessionId: id,
+                text,
+                attachments: refs,
+                intent,
+              },
+        );
       })
       .catch((reason) => {
         if (alive.current && version === bindingVersion.current)
@@ -899,7 +917,8 @@ function ConnectedRemoteSession({
     command:
       | { type: "dequeue"; messageId: string }
       | { type: "editQueued"; messageId: string; text: string }
-      | { type: "resumeQueue" },
+      | { type: "resumeQueue" }
+      | { type: "steer"; messageId: string },
   ) => {
     if (!hostSession || !online || pending) return;
     void run({
@@ -961,7 +980,14 @@ function ConnectedRemoteSession({
         !planBlockId &&
         !options?.draftBlockId &&
         message(hostSession.id, text, undefined, [], intent).type === "send" &&
-        enqueue(hostSession.id, text, attachments, intent, options?.onRejected)
+        enqueue(
+          hostSession.id,
+          text,
+          attachments,
+          intent,
+          options?.onRejected,
+          steerable && intent === "default",
+        )
       );
     const turn = optimisticTurn(
       text,
@@ -1393,7 +1419,9 @@ function ConnectedRemoteSession({
     // The host may send the message being edited; saving then reports that.
     onQueuedMessageEditingChange: noop,
     // Host providers cannot add to a running turn.
-    onSteerQueuedMessage: undefined,
+    onSteerQueuedMessage: steerable
+      ? (_, messageId) => queueCommand({ type: "steer", messageId })
+      : undefined,
     onResumeQueue: () => queueCommand({ type: "resumeQueue" }),
     onUsageLimitResume: noop,
     onUsageLimitResumeAtReset: noop,

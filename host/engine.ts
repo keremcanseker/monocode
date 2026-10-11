@@ -21,6 +21,7 @@ import {
   formatSessionTitle,
   titleFromPrompt,
   type Attachment,
+  type QueuedMessage,
   type Block,
   type Session,
 } from "../src/features/sessions/model/session";
@@ -88,6 +89,14 @@ function modelSettings(value: unknown): Record<string, string> {
     throw new Error("Invalid model settings");
   return Object.fromEntries(entries) as Record<string, string>;
 }
+
+/** Images go to the provider inline, as the desktop sends them. */
+const withImageData = (attachments: Attachment[]): Attachment[] =>
+  attachments.map((file) =>
+    isVisionImage(file.mimeType) && file.path && file.size <= 20 * 1024 * 1024
+      ? { ...file, data: readFileSync(file.path).toString("base64") }
+      : file,
+  );
 
 export function parseCommand(input: unknown): HostCommand {
   if (!input || typeof input !== "object" || Array.isArray(input))
@@ -184,6 +193,25 @@ export function parseCommand(input: unknown): HostCommand {
       ...(v.type === "send" && v.planBlockId !== undefined
         ? { planBlockId: text(v.planBlockId, "plan block ID") }
         : {}),
+    };
+  }
+  if (v.type === "steer") {
+    if (v.messageId !== undefined)
+      return {
+        type: "steer",
+        commandId,
+        sessionId,
+        messageId: text(v.messageId, "queued message ID"),
+      };
+    const attachments = parseRemoteAttachments(v.attachments);
+    if (!prompt(v.text) || (!v.text.trim() && attachments.length === 0))
+      throw new Error("Invalid prompt");
+    return {
+      type: "steer",
+      commandId,
+      sessionId,
+      text: v.text,
+      ...(attachments.length ? { attachments } : {}),
     };
   }
   if (v.type === "removeDraft")
@@ -702,6 +730,75 @@ export class HostEngine {
           };
           // The turn it was meant to follow may have ended in the meantime.
           effect = () => this.dispatchQueued(command.sessionId);
+        } else if (command.type === "steer") {
+          const queued = value.session.queuedMessages ?? [];
+          const fromQueue = command.messageId
+            ? queued.find((message) => message.id === command.messageId)
+            : undefined;
+          if (command.messageId && !fromQueue)
+            throw new Error("This queued message is no longer waiting");
+          const message = fromQueue ?? {
+            id: command.commandId,
+            text: command.text ?? "",
+            attachments: resolveAttachments(this.store, command.attachments ?? []),
+          };
+          const rest = queued.filter((entry) => entry !== fromQueue);
+          const lastTurn = value.session.blocks.findLast(
+            (block) => block.role === "user" && block.startedAt != null,
+          );
+          if (
+            value.status !== "running" ||
+            !provider.steer ||
+            // A turn being stopped, or a compaction, cannot answer it.
+            this.running.get(command.sessionId)?.cancelled ||
+            lastTurn?.text === "/compact"
+          ) {
+            // The turn ended meanwhile: the message goes next instead.
+            value = {
+              ...value,
+              session: {
+                ...value.session,
+                queuedMessages: [message, ...rest],
+                queueStatus: value.session.queueStatus ?? "active",
+              },
+            };
+            effect = () => this.dispatchQueued(command.sessionId);
+          } else {
+            const runId = value.runId!;
+            value = {
+              ...value,
+              session: {
+                ...value.session,
+                queuedMessages: rest.length ? rest : undefined,
+                queueStatus: rest.length ? value.session.queueStatus : undefined,
+                blocks: [
+                  ...value.session.blocks,
+                  {
+                    id: message.id,
+                    role: "user",
+                    text: message.text,
+                    ...(message.attachments.length
+                      ? { attachments: message.attachments }
+                      : {}),
+                    sentAt: Date.now(),
+                  },
+                ],
+              },
+            };
+            effect = (saved) => {
+              const { id, cwd, model, modelSettings } = saved.session;
+              void provider
+                .steer!({
+                  sessionId: id,
+                  cwd,
+                  model,
+                  modelSettings,
+                  text: message.text,
+                  attachments: withImageData(message.attachments),
+                })
+                .catch(() => this.steerFailed(id, runId, message));
+            };
+          }
         } else if (
           command.type === "dequeue" ||
           command.type === "editQueued"
@@ -909,6 +1006,36 @@ export class HostEngine {
     };
   }
 
+  /** A steer the provider refused, as the turn ended under it, goes next
+   * instead, so the message is never lost. */
+  private steerFailed(id: string, runId: string, message: QueuedMessage): void {
+    try {
+      this.flush(id);
+      const value = this.store.session(id);
+      if (!value.session.blocks.some((block) => block.id === message.id)) return;
+      const saved = this.save(
+        {
+          ...value,
+          session: {
+            ...value.session,
+            blocks: value.session.blocks.filter((block) => block.id !== message.id),
+            queuedMessages: [message, ...(value.session.queuedMessages ?? [])],
+            queueStatus: value.session.queueStatus ?? "active",
+          },
+        },
+        { type: "steer.failed", messageId: message.id, runId },
+      );
+      const live = this.live.get(id);
+      if (live) live.value = saved;
+      this.dispatchQueued(id);
+    } catch (error) {
+      console.error(
+        "Returning a refused steer to the queue failed:",
+        error instanceof Error ? error.message : "unknown error",
+      );
+    }
+  }
+
   /** Sends the next queued follow-up once its session is idle. */
   private dispatchQueued(id: string): void {
     if (this.closing || this.running.has(id)) return;
@@ -1045,16 +1172,7 @@ export class HostEngine {
               await provider.send({
                 ...input,
                 text: session.harness === "hermes" ? withHermesSkills(prompt) : prompt,
-                attachments: attachments?.map((file) =>
-                  isVisionImage(file.mimeType) &&
-                  file.path &&
-                  file.size <= 20 * 1024 * 1024
-                    ? {
-                        ...file,
-                        data: readFileSync(file.path).toString("base64"),
-                      }
-                    : file,
-                ),
+                attachments: attachments && withImageData(attachments),
               });
           }
         } catch (reason) {

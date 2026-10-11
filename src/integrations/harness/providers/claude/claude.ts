@@ -156,6 +156,12 @@ type Live = {
   backgroundRows: Map<string, string>;
   /** A task finished after Claude yielded; its follow-up turn is on the way. */
   awaitingResume: ReturnType<typeof setTimeout> | null;
+  /**
+   * A message was written into the turn and Claude has not reached a tool
+   * boundary since, where it takes such messages in. If the turn ends first,
+   * Claude answers it in a turn of its own right after.
+   */
+  steerPending: boolean;
   /** Last background list sent to the UI, to skip repeats. */
   backgroundKey: string;
   /** Finished-subagent notes held until Claude picks the thread back up. */
@@ -366,6 +372,7 @@ export async function steerClaudeTurn(input: SteerTurnInput): Promise<void> {
   if (content.length === 0) return;
 
   await writeJson(input.sessionId, message);
+  live.steerPending = true;
 }
 
 export function respondClaudeApproval(
@@ -617,6 +624,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     backgroundTasks: new Map(),
     backgroundRows: new Map(),
     awaitingResume: null,
+    steerPending: false,
     backgroundKey: "",
     taskNotes: [],
     stoppedAgentCalls: new Set(),
@@ -876,6 +884,9 @@ function handleLine(sessionId: string, live: Live, line: string): void {
     return;
   }
   if (type === "user") {
+    // A tool result is the boundary where Claude takes in a message
+    // written into the turn.
+    if (!isSubagentMessage(rec)) live.steerPending = false;
     handleUser(live, rec);
     return;
   }
@@ -1166,6 +1177,17 @@ function handleResult(live: Live, rec: Record<string, unknown>): void {
     live.onEvent({ type: "usage.limited", ...usageLimit });
   }
   live.turnResultSeen = true;
+  // Claude answers a message that came in too late for this turn in one of
+  // its own; keep the MonoCode turn open for it, as for a finished task.
+  if (live.steerPending && live.activeTurn && !live.cancelled) {
+    live.steerPending = false;
+    clearAwaitingResume(live);
+    live.awaitingResume = setTimeout(() => {
+      live.awaitingResume = null;
+      maybeFinishTurn(live);
+      syncBackgroundWait(live);
+    }, RESUME_GRACE_MS);
+  }
   maybeFinishTurn(live);
   showBackgroundRows(live);
   syncBackgroundWait(live);

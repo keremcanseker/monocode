@@ -11,6 +11,7 @@ import * as antigravity from "../src/integrations/harness/providers/antigravity/
 import * as devin from "../src/integrations/harness/providers/devin/devin";
 import type {
   SendTurnInput,
+  SteerTurnInput,
   CompactContextInput,
   ApprovalDecision,
 } from "../src/integrations/harness/core/types";
@@ -40,6 +41,8 @@ export interface HostProvider {
   cancel(id: string): Promise<void>;
   stop(id: string): Promise<void>;
   bind(id: string, providerId: string, cwd: string): void;
+  /** Hand a message to the running turn; rejects when there is none. */
+  steer?(input: SteerTurnInput): Promise<void>;
   /** Start `id` as a copy of another conversation, made on its first turn. */
   fork?(id: string, from: { from: string; at?: string }, cwd: string): void;
   approve(id: string, request: number, decision: ApprovalDecision): void;
@@ -55,6 +58,7 @@ export interface HostProvider {
 export const hostProviders: Record<RemoteProvider, HostProvider> = {
   codex: {
     send: codex.sendCodexTurn,
+    steer: codex.steerCodexTurn,
     compact: codex.compactCodexContext,
     cancel: codex.cancelCodexTurn,
     stop: codex.forgetCodexSession,
@@ -66,6 +70,7 @@ export const hostProviders: Record<RemoteProvider, HostProvider> = {
   },
   claude: {
     send: claude.sendClaudeTurn,
+    steer: claude.steerClaudeTurn,
     compact: claude.compactClaudeContext,
     cancel: claude.cancelClaudeTurn,
     stop: claude.forgetClaudeSession,

@@ -43,6 +43,7 @@ const {
   respondClaudeQuestion,
   restoreClaudeTaskLists,
   sendClaudeTurn,
+  steerClaudeTurn,
   stopClaudeSession,
   stopClaudeSubagent,
   __claudeTestReset,
@@ -1470,6 +1471,49 @@ describe("claude subagents", () => {
       status: "completed",
       detail: "Found the auth entry points",
     });
+  });
+
+  it("keeps the turn open for a message Claude answers after its result", async () => {
+    const { turn } = await startTurn("s1");
+    let settled = false;
+    void turn.then(() => {
+      settled = true;
+    });
+    emit({
+      type: "assistant",
+      session_id: "sess_1",
+      message: { content: [{ type: "text", text: "Done." }] },
+    });
+    await steerClaudeTurn({
+      sessionId: "s1",
+      cwd: "/repo",
+      model: "claude:claude-sonnet-5",
+      text: "also check the tests",
+    });
+    // Too late for this turn: Claude ends it, then answers in one of its own.
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(settled).toBe(false);
+    emitFollowUpTurn("The tests pass.");
+    await turn;
+    expect(settled).toBe(true);
+  });
+
+  it("ends the turn at its result when Claude took the message in mid-turn", async () => {
+    const { turn } = await startTurn("s1");
+    await steerClaudeTurn({
+      sessionId: "s1",
+      cwd: "/repo",
+      model: "claude:claude-sonnet-5",
+      text: "also check the tests",
+    });
+    emit({
+      type: "user",
+      session_id: "sess_1",
+      message: { content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }] },
+    });
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await turn;
   });
 
   it("stays busy after a parent result while a background subagent is running", async () => {

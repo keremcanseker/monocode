@@ -205,6 +205,16 @@ export type HostCommand =
       attachments?: RemoteAttachment[];
       intent?: "default" | "plan" | "build";
     }
+  /** Hands a message to the running turn, a new one or a queued one by ID;
+   * if the turn has ended, it goes next instead. */
+  | {
+      type: "steer";
+      commandId: string;
+      sessionId: string;
+      text?: string;
+      attachments?: RemoteAttachment[];
+      messageId?: string;
+    }
   | {
       type: "dequeue";
       commandId: string;

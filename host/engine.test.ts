@@ -1101,3 +1101,48 @@ describe("forking a host conversation", () => {
     ).toThrow("cannot be forked");
   });
 });
+
+describe("steering a running host turn", () => {
+  it("puts the message into the running turn at once", async () => {
+    const { engine, store, turns, provider, id } = setup("claude");
+    provider.steer = vi.fn(async () => {});
+    engine.command({ type: "send", commandId: "turn", sessionId: id, text: "Work" });
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
+    engine.command({ type: "steer", commandId: "steer", sessionId: id, text: "Also this" });
+    const blocks = store.session(id).session.blocks;
+    expect(blocks.at(-1)).toMatchObject({ id: "steer", role: "user", text: "Also this" });
+    expect(store.session(id).session.queuedMessages).toBeUndefined();
+    expect(provider.steer).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: id, text: "Also this" }),
+    );
+    turns[0].finish();
+  });
+
+  it("sends a message the turn could no longer take right after it, never dropping it", async () => {
+    const { engine, store, turns, provider, id } = setup("claude");
+    provider.steer = vi.fn(async () => {
+      throw new Error("No active turn to steer");
+    });
+    engine.command({ type: "send", commandId: "turn", sessionId: id, text: "Work" });
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
+    engine.command({ type: "steer", commandId: "steer", sessionId: id, text: "Also this" });
+    await vi.waitFor(() =>
+      expect(store.session(id).session.queuedMessages?.[0]?.id).toBe("steer"),
+    );
+    expect(store.session(id).session.blocks.some((block) => block.id === "steer")).toBe(false);
+    turns[0].finish();
+    await vi.waitFor(() => expect(turns).toHaveLength(2));
+    expect(turns[1].input).toMatchObject({ text: "Also this" });
+    turns[1].finish();
+  });
+
+  it("starts a turn with a steer that arrives after the turn ended", async () => {
+    const { engine, turns, provider, id } = setup("claude");
+    provider.steer = vi.fn(async () => {});
+    engine.command({ type: "steer", commandId: "late", sessionId: id, text: "Late" });
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
+    expect(turns[0].input).toMatchObject({ text: "Late" });
+    expect(provider.steer).not.toHaveBeenCalled();
+    turns[0].finish();
+  });
+});
