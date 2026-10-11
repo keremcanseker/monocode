@@ -31,7 +31,7 @@ type Props = {
     pin?: boolean,
     repoCwd?: string,
   ) => void;
-  onOpenAllChanges: (repoCwd?: string) => void;
+  onOpenAllChanges: (kind: GitFileDiffKind, repoCwd?: string) => void;
   onOpenCommit: (
     commit: GitHistoryCommit,
     pin?: boolean,
@@ -103,7 +103,7 @@ export function SourceControl({
           ) : null
         }
         onOpenFile={(path, kind, pin) => onOpenFile(path, kind, pin, repo)}
-        onOpenAllChanges={() => onOpenAllChanges(repo)}
+        onOpenAllChanges={(kind) => onOpenAllChanges(kind, repo)}
         onOpenCommit={(commit, pin) => onOpenCommit(commit, pin, repo)}
       />
     </div>

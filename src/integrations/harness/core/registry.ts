@@ -1,5 +1,7 @@
 import type {
+  Block,
   HarnessId,
+  TaskListMeta,
   TurnIntent,
 } from "../../../features/sessions/model/session";
 import { invoke, isTauri } from "@tauri-apps/api/core";
@@ -32,6 +34,9 @@ export type TextPromptInput = {
   providerAccountId?: string;
   model?: string;
   modelSettings?: Record<string, string>;
+  /** Codex defaults to unsaved threads; false allows resumable side questions. */
+  ephemeral?: boolean;
+  codexStore?: "mono";
   threadId?: string;
   onThreadId?: (threadId: string) => void;
   intent?: TurnIntent;
@@ -86,12 +91,18 @@ export type HarnessAdapter = {
     cwd: string,
     providerAccountId?: string,
   ): void;
+  /** Seed provider task state from a restored session's persisted panels. */
+  restoreTaskLists?(threadId: string, lists: TaskListMeta[]): void;
   /** Refresh the model catalog overlay when supported. */
   refreshCatalog?(): Promise<void>;
   /** Optional LLM tab title for the first turn. */
   generateTitle?(input: TitleInput): Promise<GeneratedSessionTitle | null>;
   /** Optional LLM commit message from staged changes. */
-  generateCommitMessage?(cwd: string, signal?: AbortSignal): Promise<string>;
+  generateCommitMessage?(
+    cwd: string,
+    signal?: AbortSignal,
+    paths?: readonly string[],
+  ): Promise<string>;
   /** Optional LLM pull request title/body from branch diff context. */
   generatePrContent?(
     cwd: string,
@@ -112,8 +123,30 @@ const adapters = new Map<HarnessId, HarnessAdapter>();
  * After a turn settles, keep the child warm for follow-ups, then park it.
  * Resume state stays, so the next prompt respawns instead of starting over.
  */
-export const HARNESS_IDLE_PARK_MS = 5 * 60_000;
-const idleParkTimers = new Map<string, ReturnType<typeof setTimeout>>();
+export const HARNESS_IDLE_PARK_MS = 3 * 60_000;
+
+/**
+ * Each warm child is a CLI process of a few hundred MB, plus its MCP servers.
+ * Past `limit` idle ones, the least recently settled is parked early, never
+ * one `keep` claims (the conversation on screen) unless the limit is zero.
+ * Running turns are not idle, so they never count.
+ */
+export type HarnessIdleParkPolicy = {
+  limit: () => number;
+  keep: (sessionId: string) => boolean;
+};
+
+let idleParkPolicy: HarnessIdleParkPolicy = {
+  limit: () => Number.POSITIVE_INFINITY,
+  keep: () => false,
+};
+let idleLimitCheck: ReturnType<typeof setTimeout> | undefined;
+
+/** Map order is settle order: the first entry has been idle longest. */
+const idleParkTimers = new Map<
+  string,
+  { harness: HarnessId; timer: ReturnType<typeof setTimeout> }
+>();
 const sessionOperationTails = new Map<string, Promise<void>>();
 const sessionSteerTails = new Map<string, Promise<void>>();
 const activeTurnSessions = new Set<string>();
@@ -165,26 +198,56 @@ function queueSteerOperation<T>(
 }
 
 function cancelIdlePark(sessionId: string): void {
-  const timer = idleParkTimers.get(sessionId);
-  if (timer) clearTimeout(timer);
+  const idle = idleParkTimers.get(sessionId);
+  if (idle) clearTimeout(idle.timer);
   idleParkTimers.delete(sessionId);
 }
 
 function scheduleIdlePark(harness: HarnessId, sessionId: string): void {
   cancelIdlePark(sessionId);
-  idleParkTimers.set(
-    sessionId,
-    setTimeout(() => {
+  idleParkTimers.set(sessionId, {
+    harness,
+    timer: setTimeout(() => {
       idleParkTimers.delete(sessionId);
       void stopHarnessSession(harness, sessionId);
     }, HARNESS_IDLE_PARK_MS),
-  );
+  });
+  // Checked once the settling operation has left the queue, so a session
+  // with a follow-up already queued is told apart from the one finishing.
+  if (idleLimitCheck === undefined) {
+    idleLimitCheck = setTimeout(enforceHarnessIdleLimit, 0);
+  }
+}
+
+export function configureHarnessIdlePark(policy: HarnessIdleParkPolicy) {
+  idleParkPolicy = policy;
+}
+
+/** Park the longest-idle children past the limit; also run when it drops. */
+export function enforceHarnessIdleLimit(): void {
+  clearTimeout(idleLimitCheck);
+  idleLimitCheck = undefined;
+  const limit = Math.max(0, idleParkPolicy.limit());
+  let excess = idleParkTimers.size - limit;
+  for (const [sessionId, { harness }] of [...idleParkTimers]) {
+    if (excess <= 0) return;
+    if (sessionOperationTails.has(sessionId)) continue;
+    if (limit > 0 && idleParkPolicy.keep(sessionId)) continue;
+    excess -= 1;
+    void stopHarnessSession(harness, sessionId);
+  }
 }
 
 /** Test seam. */
 export function resetHarnessIdlePark(): void {
-  for (const timer of idleParkTimers.values()) clearTimeout(timer);
+  for (const { timer } of idleParkTimers.values()) clearTimeout(timer);
   idleParkTimers.clear();
+  clearTimeout(idleLimitCheck);
+  idleLimitCheck = undefined;
+  idleParkPolicy = {
+    limit: () => Number.POSITIVE_INFINITY,
+    keep: () => false,
+  };
 }
 
 export function registerHarness(adapter: HarnessAdapter): void {
@@ -227,7 +290,13 @@ export function sendHarnessTurn(input: SendTurnInput & { harness: HarnessId }) {
       });
     activeTurnSessions.add(input.sessionId);
     try {
-      await adapter.sendTurn(input);
+      await adapter.sendTurn({
+        ...input,
+        onAccepted: () => {
+          input.onEvent({ type: "turn.ready" });
+          input.onAccepted?.();
+        },
+      });
     } finally {
       activeTurnSessions.delete(input.sessionId);
       if (controlled)
@@ -398,13 +467,16 @@ export function bindHarnessSession(
   providerSessionId: string,
   cwd: string,
   providerAccountId?: string,
+  /** Restored transcript, so the adapter can reseed its task state. */
+  blocks?: Block[],
 ): void {
-  getHarness(harness)?.bindSession(
-    threadId,
-    providerSessionId,
-    cwd,
-    providerAccountId,
+  const adapter = getHarness(harness);
+  adapter?.bindSession(threadId, providerSessionId, cwd, providerAccountId);
+  if (!blocks || !adapter?.restoreTaskLists) return;
+  const lists = blocks.flatMap((block) =>
+    block.role === "tasks" && block.taskList ? [block.taskList] : [],
   );
+  if (lists.length > 0) adapter.restoreTaskLists(threadId, lists);
 }
 
 /**
@@ -412,8 +484,10 @@ export function bindHarnessSession(
  * Boot used to refresh every adapter; that spawned unused CLIs (Pi with
  * extensions can sit at ~1GB) even when the workspace never touched them.
  */
+/** `force` re-reads a catalog that already loaded, e.g. after a CLI update. */
 export async function refreshHarnessCatalogs(
   ids: Iterable<HarnessId>,
+  options?: { force?: boolean },
 ): Promise<void> {
   const wanted = new Set(ids);
   if (wanted.size === 0) return;
@@ -421,7 +495,10 @@ export async function refreshHarnessCatalogs(
     [...adapters.values()]
       .filter((adapter) => wanted.has(adapter.id))
       .map(async (adapter) => {
-        if (!adapter.refreshCatalog || hasLiveCatalog(adapter.id)) return;
+        if (!adapter.refreshCatalog) return;
+        // `force` marks an explicit user action (opening the model dropdown);
+        // routine refreshes keep skipping adapters with a live catalog.
+        if (!options?.force && hasLiveCatalog(adapter.id)) return;
         await adapter.refreshCatalog().catch((error: unknown) => {
           console.debug(`[monocode] ${adapter.id} catalog`, error);
         });
@@ -442,13 +519,16 @@ export async function generateHarnessCommitMessage(
   harness: HarnessId,
   cwd: string,
   signal?: AbortSignal,
+  paths?: readonly string[],
 ): Promise<string> {
   const adapter = requireHarness(harness);
   if (!adapter.generateCommitMessage) {
     throw new Error(`${harness} does not support commit message generation`);
   }
   signal?.throwIfAborted();
-  return adapter.generateCommitMessage(cwd, signal);
+  return paths === undefined
+    ? adapter.generateCommitMessage(cwd, signal)
+    : adapter.generateCommitMessage(cwd, signal, paths);
 }
 
 export async function generateHarnessPrContent(

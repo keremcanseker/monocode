@@ -1,6 +1,11 @@
+import { TurnNotReadyError } from "../../core/types";
 import { nativeModelId } from "../../../../features/sessions/model/models";
 import { sameProviderAccountId } from "../../../../features/providers/model/providerAccounts";
-import type { RuntimeMode } from "../../../../features/sessions/model/session";
+import type {
+  RuntimeMode,
+  TaskListItem,
+  TaskListMeta,
+} from "../../../../features/sessions/model/session";
 import { loadClaudeHooks } from "../../../../features/settings/model/settings";
 import {
   killChild,
@@ -34,6 +39,7 @@ import {
   isSubagentMessage,
   isTerminalAgentTaskStatus,
   isTodoTool,
+  applyClaudeTaskTool,
   isUsageLimitResult,
   normalizeClaudeCliEffort,
   parseBackgroundTasks,
@@ -169,6 +175,8 @@ type Live = {
    * resumes reports under that call again, so this outlives the turn.
    */
   agentOrigins: Map<string, string>;
+  /** TaskCreate/TaskUpdate items, keyed by Claude's task id. */
+  claudeTasks: Map<string, TaskListItem>;
   turnResultSeen: boolean;
   /** Latest `rate_limit_event` refused requests; reported when the turn ends. */
   usageLimit: { resetsAt?: number } | null;
@@ -215,6 +223,17 @@ const RESUME_GRACE_MS = 15_000;
 
 const liveByThread = new Map<string, Live>();
 const resumeByThread = new Map<string, Resume>();
+/**
+ * Claude task lists outlive a Live: a restart that resumes the conversation
+ * keeps its task ids, so later TaskUpdate calls must find earlier tasks. Task
+ * ids belong to one Claude conversation, so each map records which one.
+ */
+const tasksByThread = new Map<
+  string,
+  { providerSessionId: string; tasks: Map<string, TaskListItem> }
+>();
+/** Task-list block key for TaskCreate/TaskUpdate items. */
+const CLAUDE_TASKS_KEY = "claude-tasks";
 const cancelledThreads = new Set<string>();
 
 /**
@@ -336,7 +355,7 @@ export async function compactClaudeContext(
 
 export async function steerClaudeTurn(input: SteerTurnInput): Promise<void> {
   const live = liveByThread.get(input.sessionId);
-  if (!live?.activeTurn) throw new Error("No active turn to steer");
+  if (!live?.activeTurn) throw new TurnNotReadyError("No active turn to steer");
 
   const message = buildClaudeUserMessage({
     text: input.text,
@@ -455,6 +474,7 @@ export async function stopClaudeSession(sessionId: string): Promise<void> {
 
 export async function forgetClaudeSession(sessionId: string): Promise<void> {
   resumeByThread.delete(sessionId);
+  tasksByThread.delete(sessionId);
   await stopClaudeSession(sessionId);
 }
 
@@ -467,6 +487,36 @@ export function bindClaudeSession(
   const sessionId = providerSessionId.trim();
   if (!threadId || !sessionId || !cwd.trim()) return;
   resumeByThread.set(threadId, { sessionId, cwd, providerAccountId });
+  // Task ids from another conversation mean nothing in this one.
+  if (tasksByThread.get(threadId)?.providerSessionId !== sessionId) {
+    tasksByThread.delete(threadId);
+  }
+}
+
+/**
+ * Seed the task map from a restored session's persisted panel. After an app
+ * restart only the transcript survives, and a resumed conversation still
+ * refers to its earlier task ids.
+ */
+export function restoreClaudeTaskLists(
+  threadId: string,
+  lists: TaskListMeta[],
+): void {
+  if (!threadId || tasksByThread.has(threadId)) return;
+  // Only a list produced by the conversation bound to this thread applies.
+  const providerSessionId = resumeByThread.get(threadId)?.sessionId;
+  if (!providerSessionId) return;
+  let items: TaskListItem[] = [];
+  for (const entry of lists) {
+    if (entry.key !== CLAUDE_TASKS_KEY) continue;
+    if (entry.providerSessionId !== providerSessionId) continue;
+    items = entry.items.filter((item) => item.id);
+  }
+  if (items.length === 0) return;
+  tasksByThread.set(threadId, {
+    providerSessionId,
+    tasks: new Map(items.map((item) => [item.id!, { ...item }])),
+  });
 }
 
 export function forkClaudeSession(input: ForkSessionInput): void {
@@ -528,11 +578,19 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   ) {
     resumeByThread.delete(input.sessionId);
   }
-
   const { path } = await resolveClaudeBinaryImpl();
   const liveRef: { current: Live | null } = { current: null };
   const claudeSessionId =
     canResume && resume ? resume.sessionId : crypto.randomUUID();
+  const retained = tasksByThread.get(input.sessionId);
+  const claudeTasks =
+    retained?.providerSessionId === claudeSessionId
+      ? retained.tasks
+      : new Map<string, TaskListItem>();
+  tasksByThread.set(input.sessionId, {
+    providerSessionId: claudeSessionId,
+    tasks: claudeTasks,
+  });
   const launch = launchOptions(
     input,
     fork ? fork.from : canResume ? resume?.sessionId : undefined,
@@ -565,6 +623,7 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     settledAgentRows: new Set(),
     listEndedRows: new Map(),
     agentOrigins: new Map(),
+    claudeTasks,
     turnResultSeen: false,
     usageLimit: null,
     cancelled: false,
@@ -682,6 +741,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
 
   try {
     await writeJson(input.sessionId, message);
+    input.onAccepted?.();
     settlePendingTurn(live);
     await turnPromise;
   } catch (error) {
@@ -744,6 +804,12 @@ function handleLine(sessionId: string, live: Live, line: string): void {
   const sessionIdFromLine = sessionIdFromMessage(rec);
   if (sessionIdFromLine && sessionIdFromLine !== live.claudeSessionId) {
     live.claudeSessionId = sessionIdFromLine;
+    // A different conversation starts with its own task ids.
+    live.claudeTasks = new Map();
+    tasksByThread.set(sessionId, {
+      providerSessionId: sessionIdFromLine,
+      tasks: live.claudeTasks,
+    });
     resumeByThread.set(sessionId, {
       sessionId: sessionIdFromLine,
       cwd: live.cwd,
@@ -1026,6 +1092,19 @@ function handleUser(live: Live, rec: Record<string, unknown>): void {
       detail: result.text || undefined,
       preview: previewFromTool(tool.name, tool.input, result.text),
     });
+    if (
+      !result.isError &&
+      applyClaudeTaskTool(live.claudeTasks, tool.name, tool.input, result.text)
+    ) {
+      live.onEvent({
+        type: "tasks.updated",
+        key: CLAUDE_TASKS_KEY,
+        // The map is the source of truth, so a TaskUpdate subject is a rename.
+        authoritative: true,
+        providerSessionId: live.claudeSessionId,
+        items: [...live.claudeTasks.values()],
+      });
+    }
     // What a subagent hands back is the last thing it said, so it closes out
     // that agent's own trail rather than sitting on the parent row as detail.
     if (isAgentToolName(tool.name) && result.text.trim() && !result.isError) {
@@ -1081,8 +1160,7 @@ function handleResult(live: Live, rec: Record<string, unknown>): void {
   // A refused window can still fall back to another model, so only a turn
   // that ended in error was stopped by it.
   const turnErrored = rec.is_error === true || result.status === "failed";
-  const usageLimit =
-    live.usageLimit ?? (isUsageLimitResult(rec) ? {} : null);
+  const usageLimit = live.usageLimit ?? (isUsageLimitResult(rec) ? {} : null);
   live.usageLimit = null;
   if (usageLimit && turnErrored && !live.cancelled) {
     live.onEvent({ type: "usage.limited", ...usageLimit });
@@ -1099,10 +1177,7 @@ async function handleControlRequest(
   control: ClaudeControlRequest,
 ): Promise<void> {
   if (control.subtype !== "can_use_tool" && control.subtype !== "permission") {
-    await writeJson(
-      sessionId,
-      buildControlResponse(control.requestId, {}),
-    );
+    await writeJson(sessionId, buildControlResponse(control.requestId, {}));
     return;
   }
 
@@ -1537,10 +1612,7 @@ function noteSubagentTool(
  * never joins the parent transcript — that would read as the main agent
  * talking — but it is the most legible thing in the panel for its own row.
  */
-function noteSubagentNarration(
-  live: Live,
-  rec: Record<string, unknown>,
-): void {
+function noteSubagentNarration(live: Live, rec: Record<string, unknown>): void {
   const parent = subagentParent(live, rec);
   if (!parent || live.settledAgentRows.has(parent.id)) return;
   const model = stringField(asRecord(rec.message), "model");
@@ -1575,10 +1647,7 @@ function noteSubagentNarration(
 }
 
 /** Settles the subagent's own tool rows once their results come back. */
-function noteSubagentResults(
-  live: Live,
-  rec: Record<string, unknown>,
-): void {
+function noteSubagentResults(live: Live, rec: Record<string, unknown>): void {
   const parent = subagentParent(live, rec);
   if (!parent) return;
   for (const result of toolResultsFromUserMessage(rec)) {
@@ -1589,11 +1658,15 @@ function noteSubagentResults(
       kind: "tool",
       text: "",
       status: result.isError ? "failed" : "completed",
+      ...(result.isError && result.text ? { detail: result.text } : {}),
     });
   }
 }
 
-/** The Agent call launched with this description that no task has claimed. */
+/**
+ * The latest Agent call launched with this description that no task has
+ * claimed, so a description used twice in one turn pairs with the newer call.
+ */
 function unclaimedAgentCall(
   live: Live,
   description: string,
@@ -1602,15 +1675,16 @@ function unclaimedAgentCall(
     [...live.agentTasks.values()].map((task) => task.toolUseId),
   );
   const wanted = description.trim();
+  let match: string | undefined;
   for (const tool of live.toolsById.values()) {
     if (!isAgentToolName(tool.name) || claimed.has(tool.id)) continue;
     // A run that already ended keeps its row; a resumed one gets its own.
     if (live.settledAgentRows.has(tool.id)) continue;
     if (stringField(tool.input, "description")?.trim() === wanted) {
-      return tool.id;
+      match = tool.id;
     }
   }
-  return undefined;
+  return match;
 }
 
 /**
@@ -1808,7 +1882,8 @@ function noteClaudeTurnStarted(live: Live): void {
 function showBackgroundRows(live: Live): void {
   if (!live.activeTurn || live.cancelled) return;
   for (const [taskId, task] of live.backgroundTasks) {
-    if (live.backgroundRows.has(taskId) || live.agentTasks.has(taskId)) continue;
+    if (live.backgroundRows.has(taskId) || live.agentTasks.has(taskId))
+      continue;
     const source = task.toolUseId
       ? live.toolsById.get(task.toolUseId)
       : undefined;
@@ -1822,7 +1897,9 @@ function showBackgroundRows(live: Live): void {
       kind: source ? toolKindFromName(source.name) : "execute",
       status: "in_progress",
       background: true,
-      ...(source ? { preview: previewFromTool(source.name, source.input) } : {}),
+      ...(source
+        ? { preview: previewFromTool(source.name, source.input) }
+        : {}),
     });
   }
 }
@@ -2016,6 +2093,7 @@ function launchOptions(
 export function __claudeTestReset(): void {
   liveByThread.clear();
   resumeByThread.clear();
+  tasksByThread.clear();
   cancelledThreads.clear();
   pendingForks = null;
 }
