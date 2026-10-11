@@ -334,6 +334,9 @@ export class HostEngine {
           value.fork,
           value.session.cwd,
         );
+      // A queue whose next message never started (a crash between turns)
+      // goes on; one behind an interrupted turn is paused above.
+      if (value.session.queuedMessages?.length) this.dispatchQueued(value.session.id);
     }
   }
 
@@ -514,10 +517,8 @@ export class HostEngine {
           throw new Error("Wait for the branch switch to finish");
         const provider = this.provider(value.session.harness);
         if (command.type === "configure") {
-          if (value.status === "running")
-            throw new Error(
-              "Wait for the current turn before changing settings",
-            );
+          // A running turn keeps the settings it started with; the change
+          // applies from the next turn, queued ones included.
           value = {
             ...value,
             session: {

@@ -329,6 +329,9 @@ function ConnectedRemoteSession({
   const busy =
     !!hostSession?.busy || unseenActive || (startingActive && !starting?.draft) || pendingSendActive;
   const queueSupported = !!descriptor?.capabilities.includes("sessions.queue");
+  const configureRunning = !!descriptor?.capabilities.includes(
+    "sessions.configureRunning",
+  );
   // An accepted turn stays on screen until a sync shows the host's copy, so
   // the transcript never drops it for a moment in between.
   useEffect(() => {
@@ -721,7 +724,10 @@ function ConnectedRemoteSession({
       return;
     }
     if (applied.current && same(changes, applied.current)) return;
-    if (busy || !online || pending || applying.current) return;
+    // Hosts that take a change mid-turn apply it from the next turn, so
+    // queued messages use it too.
+    if ((busy && !configureRunning) || !online || pending || applying.current)
+      return;
     applying.current = true;
     const sent = changes;
     void run({

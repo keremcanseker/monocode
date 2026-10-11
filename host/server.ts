@@ -295,6 +295,7 @@ export function createHostServer(
                 "sessions.plan",
                 "sessions.fork",
                 "sessions.queue",
+                "sessions.configureRunning",
                 "skills.list",
                 "agents.inventory",
               ],

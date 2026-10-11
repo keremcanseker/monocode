@@ -492,7 +492,7 @@ describe("headless session ownership", () => {
     await vi.waitFor(() => expect(store.session(id).status).toBe("idle"));
   });
 
-  it("persists model and permission changes for the next turn and rejects changes mid-turn", async () => {
+  it("persists model and permission changes for the next turn, also when made mid-turn", async () => {
     const { engine, store, turns, id } = setup();
     const change = {
       type: "configure",
@@ -521,10 +521,14 @@ describe("headless session ownership", () => {
       modelSettings: { reasoningEffort: "high" },
       runtimeMode: "full-access",
     });
-    expect(() => engine.command({ ...change, commandId: "later" })).toThrow(
-      "current turn",
-    );
+    // A change during the turn waits for the next one, a queued one included.
+    engine.command({ ...change, commandId: "later", model: "codex:later" });
+    engine.command({ type: "enqueue", commandId: "queued", sessionId: id, text: "Next" });
+    expect(turns[0].input.model).toBe("codex:new");
     turns[0].finish();
+    await vi.waitFor(() => expect(turns).toHaveLength(2));
+    expect(turns[1].input.model).toBe("codex:later");
+    turns[1].finish();
   });
   it("keeps working with no client, persists output, and deduplicates a lost acknowledgement", async () => {
     const { engine, store, turns, provider, id } = setup();
