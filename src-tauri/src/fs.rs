@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -5066,11 +5066,13 @@ impl<'a> From<Option<&'a AtomicBool>> for WalkStop<'a> {
 fn walk_project_files(root: &Path, stop: WalkStop<'_>) -> Vec<ProjectFile> {
     let ignore = Ignore::load(root);
     let mut files = Vec::new();
-    let mut dirs = vec![root.to_path_buf()];
+    // Breadth first, so when a deep tree hits the caps it is its depths that
+    // go missing, not the files near the root.
+    let mut dirs = VecDeque::from([root.to_path_buf()]);
     let mut visited = 0usize;
     let mut seen = 0usize;
 
-    while let Some(dir) = dirs.pop() {
+    while let Some(dir) = dirs.pop_front() {
         if stop.stopped(seen) {
             break;
         }
@@ -5102,7 +5104,7 @@ fn walk_project_files(root: &Path, stop: WalkStop<'_>) -> Vec<ProjectFile> {
                 if skip_walk_dir_name(name) || ignore.matches(name) || is_private_dir(&path) {
                     continue;
                 }
-                dirs.push(path);
+                dirs.push_back(path);
                 continue;
             }
             if ignore.matches(name) {
@@ -5156,6 +5158,9 @@ fn skip_walk_dir_name(name: &str) -> bool {
             | "bower_components"
             | ".yarn"
             | ".pnpm-store"
+            // SwiftPM and Xcode build products.
+            | ".build"
+            | "DerivedData"
     )
 }
 
@@ -6675,6 +6680,27 @@ mod tests {
             midway.len(),
             all.len()
         );
+    }
+
+    #[test]
+    fn walk_skips_swift_builds_and_keeps_shallow_files_past_the_caps() {
+        let dir = tmp("index-swift");
+        let research = dir.0.join("apps").join("research");
+        std::fs::create_dir_all(&research).unwrap();
+        std::fs::write(research.join("notes.md"), "x\n").unwrap();
+        let checkouts = dir.0.join("apps").join("ios").join(".build");
+        std::fs::create_dir_all(checkouts.join("checkouts")).unwrap();
+        std::fs::write(checkouts.join("checkouts").join("AGENTS.md"), "x\n").unwrap();
+        // More folders than the walk visits, deeper than the note.
+        let deep = dir.0.join("apps").join("big").join("tree");
+        for index in 0..=MAX_WALK_DIRS {
+            std::fs::create_dir_all(deep.join(index.to_string())).unwrap();
+        }
+
+        let files = walk_project_files(&dir.0, WalkStop::Never);
+        let paths = relative_paths(&files);
+        assert!(paths.contains(&"apps/research/notes.md"));
+        assert!(!paths.iter().any(|r| r.contains(".build")));
     }
 
     #[test]

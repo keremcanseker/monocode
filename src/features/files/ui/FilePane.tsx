@@ -18,7 +18,7 @@ import {
   type EditorPane,
   type FilePaneTab,
 } from "../../workspace/model/layout";
-import { isImagePath } from "../model/filePreview";
+import { isPreviewPath } from "../model/filePreview";
 import type { TerminalMetaPatch } from "../../terminal/model/terminalTab";
 import type { EditorNavigationTarget } from "../../search/model/search";
 import { editorPathsEqual } from "../../search/model/search";
@@ -209,7 +209,7 @@ function FilePaneComponent({
                     onTerminalMetaChange?.(file.id, patch)
                   }
                 />
-              ) : isImagePath(file.path) ? (
+              ) : isPreviewPath(file.path) ? (
                 <BinaryFileView path={file.path} cwd={file.cwd} />
               ) : (
                 <FileEditor

@@ -1,23 +1,37 @@
 import { describe, expect, it } from "vitest";
-import { formatFileSize, isImagePath, sniffImageMime } from "./filePreview";
+import {
+  formatFileSize,
+  isPdfBytes,
+  isPreviewPath,
+  sniffImageMime,
+} from "./filePreview";
 
 function bytes(...values: number[]): Uint8Array {
   return new Uint8Array(values);
 }
 
-describe("isImagePath", () => {
-  it("routes images away from the editor", () => {
-    expect(isImagePath("/w/shot.png")).toBe(true);
-    expect(isImagePath("/w/Photo.JPEG")).toBe(true);
-    expect(isImagePath("/w/icon.webp")).toBe(true);
+describe("isPreviewPath", () => {
+  it("routes images and PDFs away from the editor", () => {
+    expect(isPreviewPath("/w/shot.png")).toBe(true);
+    expect(isPreviewPath("/w/Photo.JPEG")).toBe(true);
+    expect(isPreviewPath("/w/icon.webp")).toBe(true);
+    expect(isPreviewPath("/w/Report.PDF")).toBe(true);
   });
 
   it("leaves text, svg and extensionless files to the editor", () => {
-    expect(isImagePath("/w/main.rs")).toBe(false);
-    expect(isImagePath("/w/logo.svg")).toBe(false);
-    expect(isImagePath("/w/spec.pdf")).toBe(false);
-    expect(isImagePath("/w/LICENSE")).toBe(false);
-    expect(isImagePath("/w/.png/notes.txt")).toBe(false);
+    expect(isPreviewPath("/w/main.rs")).toBe(false);
+    expect(isPreviewPath("/w/logo.svg")).toBe(false);
+    expect(isPreviewPath("/w/LICENSE")).toBe(false);
+    expect(isPreviewPath("/w/.png/notes.txt")).toBe(false);
+  });
+});
+
+describe("isPdfBytes", () => {
+  it("finds the header, even after leading junk", () => {
+    const encode = (text: string) => new TextEncoder().encode(text);
+    expect(isPdfBytes(encode("%PDF-1.7\n"))).toBe(true);
+    expect(isPdfBytes(encode("\r\n%PDF-1.4"))).toBe(true);
+    expect(isPdfBytes(encode("<html>%PD"))).toBe(false);
   });
 });
 

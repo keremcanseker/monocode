@@ -9,15 +9,17 @@ const IMAGE_EXTENSIONS = new Set([
   ".avif",
   ".bmp",
   ".ico",
+  ".pdf",
 ]);
 
 /**
- * Whether a path belongs to the image viewer, decided before anything is read.
+ * Whether a path belongs to the image and PDF viewer, decided before anything
+ * is read.
  *
  * `.svg` is deliberately absent: it is text, so it keeps opening in the editor,
  * which offers its own rendered preview alongside the source.
  */
-export function isImagePath(path: string): boolean {
+export function isPreviewPath(path: string): boolean {
   const name = basename(path).toLowerCase();
   const extension = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
   return IMAGE_EXTENSIONS.has(extension);
@@ -51,6 +53,12 @@ export function sniffImageMime(bytes: Uint8Array): string | null {
     if (brand === "avif" || brand === "avis") return "image/avif";
   }
   return null;
+}
+
+/** PDF bytes, which may carry junk before the header as readers allow. */
+export function isPdfBytes(bytes: Uint8Array): boolean {
+  const head = String.fromCharCode(...bytes.subarray(0, 1024));
+  return head.includes("%PDF-");
 }
 
 /** Byte count for the viewer footer, in the units a file manager would show. */
