@@ -1,6 +1,7 @@
 import {
   ALT,
   IS_MAC,
+  IS_WEB,
   IS_WIN,
   MOD,
   SHIFT,
@@ -800,7 +801,8 @@ export function subscribeNotesEnabled(onStoreChange: () => void) {
 
 const MONOS_ENABLED_KEY = "monocode.monosEnabled";
 
-export const MONOS_ENABLED_DEFAULT = true;
+// A Mono is a local session with its own store and habits; a browser has neither.
+export const MONOS_ENABLED_DEFAULT = !IS_WEB;
 
 /** Fired on `window` when monos are shown or hidden. */
 export const MONOS_ENABLED_CHANGE_EVENT = "monocode:monos-enabled-change";

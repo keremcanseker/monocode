@@ -58,6 +58,7 @@ const QUIET = [
   "reminder_take_open",
   "quick_composer_take",
   "control_load",
+  "autosave_set_enabled",
 ];
 
 const handlers: Record<string, (args: Args) => unknown> = {

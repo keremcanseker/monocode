@@ -10,6 +10,7 @@ vi.mock("../../../platform/tauri/platform", () => ({
   IS_MAC: true,
   IS_WIN: false,
   IS_LINUX: false,
+  IS_WEB: false,
   HAS_NATIVE_GLASS: true,
   MOD: "⌘",
   ALT: "⌥",
