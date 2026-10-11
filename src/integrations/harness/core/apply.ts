@@ -22,6 +22,7 @@ import { taskListText } from "../../../features/sessions/model/taskList";
 import { isReviewablePlan } from "../../../features/sessions/model/plan";
 import { resolveModel } from "../../../features/sessions/model/models";
 import type { HarnessEvent } from "./types";
+import { usageLimitFromError } from "../../../features/sessions/model/usageLimit";
 
 /** Apply one delivery batch without copying the transcript for every token. */
 export function applyHarnessEvents(
@@ -75,6 +76,7 @@ export function applyHarnessEvent(
         kind: event.kind,
         status: event.status,
         preview: event.preview,
+        paths: event.paths,
         streaming: true,
         agentModel: event.agentModel,
         ...(event.background ? { background: true } : {}),
@@ -87,6 +89,7 @@ export function applyHarnessEvent(
         status: event.status,
         detail: event.detail,
         preview: event.preview,
+        paths: event.paths,
         streaming:
           event.status !== "completed" &&
           event.status !== "failed" &&
@@ -156,12 +159,22 @@ export function applyHarnessEvent(
     case "plan":
       return upsertPlan(session, event);
     case "session.error":
-      return appendBlock(failStreaming(session), {
-        id: crypto.randomUUID(),
-        role: "system",
-        text: event.message,
-        notice: "error",
-      });
+      return appendBlock(
+        failStreaming({
+          ...session,
+          usageLimit: session.usageLimit ?? usageLimitFromError(event.message),
+          // Do not drain remaining messages into the same failed connection.
+          queueStatus: session.queuedMessages?.length
+            ? "paused"
+            : session.queueStatus,
+        }),
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          text: event.message,
+          notice: "error",
+        },
+      );
     case "session.providerBound": {
       if (session.providerSessionId === event.providerSessionId) return session;
       // Turn boundaries from the conversation this one replaces mean nothing
@@ -183,10 +196,16 @@ export function applyHarnessEvent(
     }
     case "turn.started":
     case "turn.anchored": {
-      // A draft saved while the turn ran is not the turn it reports on.
+      // A draft saved while the turn ran, or a message still queued, is not
+      // the turn it reports on.
       const index = lastMatchingBlock(
         session.blocks,
-        (block) => block.role === "user" && !block.draft,
+        (block) =>
+          block.role === "user" &&
+          !block.draft &&
+          !session.queuedMessages?.some(
+            (message) => message.blockId === block.id,
+          ),
       );
       if (index < 0) return session;
       const block = session.blocks[index];
@@ -195,6 +214,8 @@ export function applyHarnessEvent(
       blocks[index] = { ...block, providerTurnId: event.providerTurnId };
       return { ...session, blocks };
     }
+    case "turn.ready":
+      return session.busy ? { ...session, turnReady: true } : session;
     case "session.configChanged":
       return {
         ...session,
@@ -209,7 +230,9 @@ export function applyHarnessEvent(
           : {}),
       };
     case "status":
-      return appendStatus(session, event.text);
+      return event.key
+        ? upsertKeyedStatus(session, event.key, event.text)
+        : appendStatus(session, event.text);
     case "usage.limited":
       return {
         ...session,
@@ -328,7 +351,14 @@ function upsertTaskList(
   );
   const existing = lastMatchingBlock(session.blocks, (block, index) => {
     if (block.role !== "tasks") return false;
-    if (key) return block.taskList?.key === key;
+    if (key) {
+      if (block.taskList?.key !== key) return false;
+      // A list from another provider conversation stays as history.
+      return (
+        !event.providerSessionId ||
+        block.taskList?.providerSessionId === event.providerSessionId
+      );
+    }
     return index > lastUser;
   });
   const previousItems =
@@ -336,7 +366,9 @@ function upsertTaskList(
   const items = previousItems
     ? event.merge
       ? mergeTaskListItems(previousItems, event.items)
-      : preserveTaskListLabels(previousItems, event.items)
+      : event.authoritative
+        ? event.items
+        : preserveTaskListLabels(previousItems, event.items)
     : event.items;
 
   if (items.length === 0) {
@@ -349,6 +381,9 @@ function upsertTaskList(
 
   const taskList = {
     ...(key ? { key } : {}),
+    ...(event.providerSessionId
+      ? { providerSessionId: event.providerSessionId }
+      : {}),
     ...(event.explanation?.trim()
       ? { explanation: event.explanation.trim() }
       : {}),
@@ -440,6 +475,7 @@ type UserTurnExtra = {
   monocode?: boolean;
   intent?: Block["intent"];
   appRequestId?: string;
+  monoSessionCompletion?: Block["monoSessionCompletion"];
 };
 
 function userTurnFields(extra?: UserTurnExtra) {
@@ -451,6 +487,9 @@ function userTurnFields(extra?: UserTurnExtra) {
     ...(extra?.monocode ? { monocode: true } : {}),
     ...(extra?.intent ? { intent: extra.intent } : {}),
     ...(extra?.appRequestId ? { appRequestId: extra.appRequestId } : {}),
+    ...(extra?.monoSessionCompletion
+      ? { monoSessionCompletion: extra.monoSessionCompletion }
+      : {}),
   };
 }
 
@@ -473,7 +512,7 @@ export function appendUser(
 ): Session {
   session = settlePendingApprovals(session);
   return appendBlock(
-    { ...session, busy: true },
+    { ...session, busy: true, turnReady: false },
     {
       id: crypto.randomUUID(),
       role: "user",
@@ -502,6 +541,7 @@ export function appendSteerUser(
         id: crypto.randomUUID(),
         role: "user",
         text,
+        sentAt: Date.now(),
         ...turnModelFields(session),
         ...(attachments.length > 0 ? { attachments } : {}),
         ...userTurnFields(extra),
@@ -516,6 +556,7 @@ export function stopStreaming(session: Session, endedAt = Date.now()): Session {
   return {
     ...settled,
     busy: false,
+    turnReady: false,
     pendingQuestion: undefined,
     blocks: stampTurnDuration(
       settled.blocks.map((block) =>
@@ -694,7 +735,10 @@ function stopBlockProgress(block: Block): Block {
 function stampTurnDuration(blocks: Block[], endedAt: number): Block[] {
   let lastUser = -1;
   for (let i = blocks.length - 1; i >= 0; i--) {
-    if (blocks[i].role === "user") {
+    const block = blocks[i];
+    // A message sent mid-turn joined it; the turn is timed from its start.
+    if (block.role === "user" && block.sentAt != null) continue;
+    if (block.role === "user") {
       lastUser = i;
       break;
     }
@@ -723,6 +767,40 @@ function appendStatus(session: Session, text: string): Session {
     role: "system",
     text: trimmed,
   });
+}
+
+function upsertKeyedStatus(
+  session: Session,
+  key: string,
+  text: string,
+): Session {
+  const trimmed = text.trim();
+  const turnStart = lastMatchingBlock(
+    session.blocks,
+    // Mono outbox bubbles and mid-turn follow-ups do not start a new turn.
+    (block) =>
+      block.role === "user" &&
+      (block.sentAt == null || block.startedAt != null) &&
+      !session.queuedMessages?.some((message) => message.blockId === block.id),
+  );
+  const index = lastMatchingBlock(
+    session.blocks,
+    (block, at) => at > turnStart && block.statusKey === key,
+  );
+  if (index < 0) {
+    if (!trimmed) return session;
+    return appendBlock(session, {
+      id: crypto.randomUUID(),
+      role: "system",
+      text: trimmed,
+      statusKey: key,
+    });
+  }
+  if (session.blocks[index].text === trimmed) return session;
+  const blocks = session.blocks.slice();
+  if (trimmed) blocks[index] = { ...blocks[index], text: trimmed };
+  else blocks.splice(index, 1);
+  return { ...session, blocks };
 }
 
 function appendImage(
@@ -900,6 +978,7 @@ function upsertTool(
     status?: string;
     detail?: string;
     preview?: ToolPreview;
+    paths?: string[];
     streaming: boolean;
     agentModel?: string;
     background?: boolean;
@@ -932,6 +1011,7 @@ function upsertTool(
         status: patch.status,
         ...(detail ? { detail } : {}),
         ...(preview ? { preview } : {}),
+        ...(patch.paths ? { paths: patch.paths } : {}),
         ...(patch.background ? { background: true } : {}),
       },
     });
@@ -952,6 +1032,7 @@ function upsertTool(
   );
   const kind = patch.kind ?? prev.tool?.kind;
   const status = patch.status ?? prev.tool?.status;
+  const paths = patch.paths ?? prev.tool?.paths;
   const agentName = prev.agentRun?.steps.length ? prev.agentRun.name : label;
   if (
     prev.text === label &&
@@ -960,6 +1041,7 @@ function upsertTool(
     prev.tool?.kind === kind &&
     prev.tool?.status === status &&
     prev.tool?.detail === detail &&
+    prev.tool?.paths === paths &&
     (!patch.agentModel || prev.agentRun?.model === patch.agentModel) &&
     (!prev.agentRun || prev.agentRun.name === agentName) &&
     samePreview(prev.tool?.preview, preview)
@@ -989,6 +1071,7 @@ function upsertTool(
       status,
       ...(detail ? { detail } : {}),
       ...(preview ? { preview } : {}),
+      ...(paths ? { paths } : {}),
       ...(prev.tool?.background ? { background: true } : {}),
     },
   };
@@ -1123,12 +1206,14 @@ function recordAgentStep(
   if (!text && event.kind !== "tool") return session;
 
   const run = prev.agentRun;
+  const detail = capToolDetail(event.detail);
   const step: AgentStep = {
     id: event.stepId,
     kind: event.kind,
     text,
     ...(event.toolKind ? { toolKind: event.toolKind } : {}),
     ...(event.status ? { status: event.status } : {}),
+    ...(detail ? { detail } : {}),
     ...(event.preview ? { preview: event.preview } : {}),
   };
 
@@ -1185,6 +1270,7 @@ function sameAgentStep(a: AgentStep, b: AgentStep): boolean {
     a.text === b.text &&
     a.toolKind === b.toolKind &&
     a.status === b.status &&
+    a.detail === b.detail &&
     samePreview(a.preview, b.preview)
   );
 }

@@ -9,20 +9,53 @@ const IMAGE_EXTENSIONS = new Set([
   ".avif",
   ".bmp",
   ".ico",
-  ".pdf",
 ]);
 
+const VIDEO_MIME_TYPES: Record<string, string> = {
+  ".mp4": "video/mp4",
+  ".m4v": "video/mp4",
+  ".mov": "video/quicktime",
+  ".webm": "video/webm",
+  ".ogv": "video/ogg",
+  ".avi": "video/x-msvideo",
+  ".mkv": "video/x-matroska",
+  ".mpg": "video/mpeg",
+  ".mpeg": "video/mpeg",
+  ".3gp": "video/3gpp",
+  ".3g2": "video/3gpp2",
+};
+
+function extensionOf(path: string): string {
+  const name = basename(path).toLowerCase();
+  return name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+}
+
 /**
- * Whether a path belongs to the image and PDF viewer, decided before anything
- * is read.
+ * Whether a path belongs to the image viewer, decided before anything is read.
  *
  * `.svg` is deliberately absent: it is text, so it keeps opening in the editor,
  * which offers its own rendered preview alongside the source.
  */
-export function isPreviewPath(path: string): boolean {
-  const name = basename(path).toLowerCase();
-  const extension = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
-  return IMAGE_EXTENSIONS.has(extension);
+export function isImagePath(path: string): boolean {
+  return IMAGE_EXTENSIONS.has(extensionOf(path));
+}
+
+/** PDFs open in the same read-only viewer, drawn by pdf.js. */
+export function isPdfPath(path: string): boolean {
+  return extensionOf(path) === ".pdf";
+}
+
+/** Route video containers to the player, which checks codec support on load. */
+export function isVideoPath(path: string): boolean {
+  return videoMimeForPath(path) !== null;
+}
+
+/**
+ * Only return explicit video MIME types, so even mislabeled markup cannot
+ * become a document through its blob URL. The media decoder validates bytes.
+ */
+export function videoMimeForPath(path: string): string | null {
+  return VIDEO_MIME_TYPES[extensionOf(path)] ?? null;
 }
 
 /**

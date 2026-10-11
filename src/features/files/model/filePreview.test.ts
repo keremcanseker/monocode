@@ -1,28 +1,38 @@
 import { describe, expect, it } from "vitest";
 import {
   formatFileSize,
+  isImagePath,
   isPdfBytes,
-  isPreviewPath,
+  isPdfPath,
+  isVideoPath,
   sniffImageMime,
+  videoMimeForPath,
 } from "./filePreview";
 
 function bytes(...values: number[]): Uint8Array {
   return new Uint8Array(values);
 }
 
-describe("isPreviewPath", () => {
-  it("routes images and PDFs away from the editor", () => {
-    expect(isPreviewPath("/w/shot.png")).toBe(true);
-    expect(isPreviewPath("/w/Photo.JPEG")).toBe(true);
-    expect(isPreviewPath("/w/icon.webp")).toBe(true);
-    expect(isPreviewPath("/w/Report.PDF")).toBe(true);
+describe("isImagePath", () => {
+  it("routes images away from the editor", () => {
+    expect(isImagePath("/w/shot.png")).toBe(true);
+    expect(isImagePath("/w/Photo.JPEG")).toBe(true);
+    expect(isImagePath("/w/icon.webp")).toBe(true);
   });
 
-  it("leaves text, svg and extensionless files to the editor", () => {
-    expect(isPreviewPath("/w/main.rs")).toBe(false);
-    expect(isPreviewPath("/w/logo.svg")).toBe(false);
-    expect(isPreviewPath("/w/LICENSE")).toBe(false);
-    expect(isPreviewPath("/w/.png/notes.txt")).toBe(false);
+  it("leaves text, svg, PDFs and extensionless files to their own routes", () => {
+    expect(isImagePath("/w/main.rs")).toBe(false);
+    expect(isImagePath("/w/logo.svg")).toBe(false);
+    expect(isImagePath("/w/spec.pdf")).toBe(false);
+    expect(isImagePath("/w/LICENSE")).toBe(false);
+    expect(isImagePath("/w/.png/notes.txt")).toBe(false);
+  });
+});
+
+describe("isPdfPath", () => {
+  it("routes PDFs to the viewer by extension, any case", () => {
+    expect(isPdfPath("/w/Report.PDF")).toBe(true);
+    expect(isPdfPath("/w/report.pdf.txt")).toBe(false);
   });
 });
 
@@ -35,11 +45,43 @@ describe("isPdfBytes", () => {
   });
 });
 
+describe("video paths", () => {
+  it.each([
+    ["/w/clip.mp4", "video/mp4"],
+    ["C:\\work\\clip.M4V", "video/mp4"],
+    ["/w/screen recording.MOV", "video/quicktime"],
+    ["remote://env/repo/clip.webm", "video/webm"],
+    ["/w/clip.ogv", "video/ogg"],
+    ["/w/clip.avi", "video/x-msvideo"],
+    ["/w/clip.mkv", "video/x-matroska"],
+    ["/w/clip.mpg", "video/mpeg"],
+    ["/w/clip.mpeg", "video/mpeg"],
+    ["/w/clip.3gp", "video/3gpp"],
+    ["/w/clip.3g2", "video/3gpp2"],
+  ])("routes %s to the player with %s", (path, mime) => {
+    expect(isVideoPath(path)).toBe(true);
+    expect(videoMimeForPath(path)).toBe(mime);
+    expect(isImagePath(path)).toBe(false);
+  });
+
+  it.each([
+    "/w/main.ts",
+    "/w/logo.svg",
+    "/w/photo.png",
+    "/w/LICENSE",
+    "/w/.mp4/notes.txt",
+    "/w/clip.mp4.html",
+  ])("does not route %s to the player", (path) => {
+    expect(isVideoPath(path)).toBe(false);
+    expect(videoMimeForPath(path)).toBeNull();
+  });
+});
+
 describe("sniffImageMime", () => {
   it("identifies each supported format by magic number", () => {
-    expect(sniffImageMime(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a))).toBe(
-      "image/png",
-    );
+    expect(
+      sniffImageMime(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)),
+    ).toBe("image/png");
     expect(sniffImageMime(bytes(0xff, 0xd8, 0xff, 0xe0))).toBe("image/jpeg");
     expect(sniffImageMime(bytes(0x47, 0x49, 0x46, 0x38, 0x39, 0x61))).toBe(
       "image/gif",

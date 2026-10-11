@@ -24,7 +24,9 @@ export type SettingsSectionId =
   | "keybindings"
   | "chat"
   | "providers"
+  | "mcp"
   | "skills"
+  | "monos"
   | "inbox"
   | "worktrees"
   | "archive";
@@ -99,12 +101,29 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
       "account sign in login model harness claude codex gemini cli default hooks",
   },
   {
+    id: "mcp",
+    group: "agents",
+    label: "MCP",
+    description:
+      "Find MCP servers across providers and manage their connections.",
+    keywords:
+      "tools servers connections oauth authenticate login claude codex cursor opencode",
+  },
+  {
     id: "skills",
     group: "agents",
     label: "Skills",
     description:
       "Discover and manage file skills from project, personal, and harness folders.",
     keywords: "skill instructions prompt",
+  },
+  {
+    id: "monos",
+    group: "agents",
+    label: "Monos",
+    description:
+      "The resident agent beside your tabs, and which projects have one.",
+    keywords: "mono resident agent mascot claim project title bar",
   },
   {
     id: "inbox",
@@ -154,7 +173,37 @@ export type SettingsEntry = {
 };
 
 export const SETTINGS_INDEX: SettingsEntry[] = [
-  { id: "remote-machines", section: "connections", label: "Your machines", keywords: "ssh remote connect host server environment" },
+  {
+    id: "remote-machines",
+    section: "connections",
+    label: "Your machines",
+    keywords: "ssh remote connect host server environment",
+  },
+  {
+    id: "mcp-servers",
+    section: "mcp",
+    label: "MCP servers",
+    keywords: "claude tools connections oauth authenticate login add remove",
+  },
+  {
+    id: "monos-enabled",
+    section: "monos",
+    label: "Show monos",
+    keywords: "mono agent rail hide",
+  },
+  {
+    id: "rail-monos-pinned",
+    section: "monos",
+    label: "Pin monos to the icon rail",
+    keywords: "mono rail compact collapsed icons top divider project picker",
+  },
+  {
+    id: "mono-list",
+    section: "monos",
+    label: "Your monos",
+    keywords:
+      "mono reset soul name projects sessions sidebar visibility hidden show",
+  },
   {
     id: "project-worktrees",
     section: "worktrees",
@@ -234,6 +283,13 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     section: "appearance",
     label: "Accent color",
     keywords: "highlight bubble send button tint",
+  },
+  {
+    id: "diff-colors",
+    section: "appearance",
+    label: "Diff colors",
+    keywords:
+      "colorblind color blind accessibility added removed red green blue orange high contrast changes",
   },
   {
     id: "hue",
@@ -321,6 +377,12 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
       "effort thinking reasoning fast service tier model picker composer",
   },
   {
+    id: "composer-autocorrect",
+    section: "chat",
+    label: "Autocorrect",
+    keywords: "spelling spell check autocorrect typo macos composer",
+  },
+  {
     id: "composer-mascot",
     section: "chat",
     label: "Composer mascot",
@@ -348,7 +410,8 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
     id: "agent-clis",
     section: "providers",
     label: "Agent CLIs",
-    keywords: "codex opencode cursor grok pi omp fx hermes antigravity binary path",
+    keywords:
+      "codex opencode cursor grok pi omp fx hermes antigravity devin binary path",
   },
   {
     id: "provider-accounts",
@@ -358,10 +421,28 @@ export const SETTINGS_INDEX: SettingsEntry[] = [
       "account sign in login rename remove delete credentials profile usage limit quota exhausted",
   },
   {
+    id: "show-remaining-usage",
+    section: "providers",
+    label: "Show remaining usage",
+    keywords: "usage limit meter bar left used quota percent",
+  },
+  {
+    id: "mask-emails",
+    section: "providers",
+    label: "Mask account emails",
+    keywords: "email privacy blur hide screenshot account",
+  },
+  {
     id: "claude-hooks",
     section: "providers",
     label: "Claude Code hooks",
     keywords: "pretooluse settings.json block command notification",
+  },
+  {
+    id: "idle-agents",
+    section: "providers",
+    label: "Keep idle agents ready",
+    keywords: "memory ram cpu performance process warm park background",
   },
   {
     id: "project-notifications",
@@ -717,6 +798,55 @@ export function subscribeNotesEnabled(onStoreChange: () => void) {
     window.removeEventListener(NOTES_ENABLED_CHANGE_EVENT, onStoreChange);
 }
 
+const MONOS_ENABLED_KEY = "monocode.monosEnabled";
+
+export const MONOS_ENABLED_DEFAULT = true;
+
+/** Fired on `window` when monos are shown or hidden. */
+export const MONOS_ENABLED_CHANGE_EVENT = "monocode:monos-enabled-change";
+
+/** Whether monos show in the title bar at all, across every project. */
+export function loadMonosEnabled(): boolean {
+  return readFlag(MONOS_ENABLED_KEY) ?? MONOS_ENABLED_DEFAULT;
+}
+
+export function saveMonosEnabled(value: boolean) {
+  writeFlag(MONOS_ENABLED_KEY, value);
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent<boolean>(MONOS_ENABLED_CHANGE_EVENT, { detail: value }),
+  );
+}
+
+export function subscribeMonosEnabled(onStoreChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(MONOS_ENABLED_CHANGE_EVENT, onStoreChange);
+  return () =>
+    window.removeEventListener(MONOS_ENABLED_CHANGE_EVENT, onStoreChange);
+}
+
+const MONO_MENU_BAR_KEY = "monocode.monoMenuBarIcon";
+
+/** Fired on `window` when the menu bar icon is shown or hidden. */
+export const MONO_MENU_BAR_CHANGE_EVENT = "monocode:mono-menu-bar-change";
+
+export function loadMonoMenuBarIcon(): boolean {
+  return readFlag(MONO_MENU_BAR_KEY) ?? true;
+}
+
+export function saveMonoMenuBarIcon(value: boolean) {
+  writeFlag(MONO_MENU_BAR_KEY, value);
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent(MONO_MENU_BAR_CHANGE_EVENT));
+}
+
+export function subscribeMonoMenuBarIcon(onStoreChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(MONO_MENU_BAR_CHANGE_EVENT, onStoreChange);
+  return () =>
+    window.removeEventListener(MONO_MENU_BAR_CHANGE_EVENT, onStoreChange);
+}
+
 const QUICK_COMPOSER_ENABLED_KEY = "monocode.quickComposerEnabled";
 const QUICK_COMPOSER_SHORTCUT_KEY = "monocode.quickComposerShortcut";
 
@@ -879,6 +1009,37 @@ export function saveFormatOnSave(value: boolean) {
   writeFlag(FORMAT_ON_SAVE_KEY, value);
 }
 
+const AUTOSAVE_KEY = "monocode.autosave";
+const AUTOSAVE_CHANGE_EVENT = "monocode:autosave-change";
+
+export const AUTOSAVE_DEFAULT = false;
+
+export function loadAutosave(): boolean {
+  return readFlag(AUTOSAVE_KEY) ?? AUTOSAVE_DEFAULT;
+}
+
+export function saveAutosave(value: boolean): boolean {
+  writeFlag(AUTOSAVE_KEY, value);
+  const saved = loadAutosave();
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(AUTOSAVE_CHANGE_EVENT));
+  }
+  return saved;
+}
+
+export function subscribeAutosave(onStoreChange: () => void) {
+  if (typeof window === "undefined") return () => {};
+  const onStorage = (event: StorageEvent) => {
+    if (event.key === AUTOSAVE_KEY) onStoreChange();
+  };
+  window.addEventListener(AUTOSAVE_CHANGE_EVENT, onStoreChange);
+  window.addEventListener("storage", onStorage);
+  return () => {
+    window.removeEventListener(AUTOSAVE_CHANGE_EVENT, onStoreChange);
+    window.removeEventListener("storage", onStorage);
+  };
+}
+
 const CLAUDE_HOOKS_KEY = "monocode.claudeHooks";
 
 export const CLAUDE_HOOKS_DEFAULT = true;
@@ -889,6 +1050,33 @@ export function loadClaudeHooks(): boolean {
 
 export function saveClaudeHooks(value: boolean) {
   writeFlag(CLAUDE_HOOKS_KEY, value);
+}
+
+const IDLE_AGENT_LIMIT_KEY = "monocode.idleAgentLimit";
+
+/** How many finished conversations keep their agent CLI warm. */
+export const IDLE_AGENT_LIMITS = [0, 1, 2, 3, 5] as const;
+export type IdleAgentLimit = (typeof IDLE_AGENT_LIMITS)[number];
+export const IDLE_AGENT_LIMIT_DEFAULT: IdleAgentLimit = 3;
+
+export function loadIdleAgentLimit(): IdleAgentLimit {
+  try {
+    const raw = Number(localStorage.getItem(IDLE_AGENT_LIMIT_KEY) ?? NaN);
+    return (
+      IDLE_AGENT_LIMITS.find((limit) => limit === raw) ??
+      IDLE_AGENT_LIMIT_DEFAULT
+    );
+  } catch {
+    return IDLE_AGENT_LIMIT_DEFAULT;
+  }
+}
+
+export function saveIdleAgentLimit(value: IdleAgentLimit) {
+  try {
+    localStorage.setItem(IDLE_AGENT_LIMIT_KEY, String(value));
+  } catch {
+    // private mode / quota
+  }
 }
 
 const CTRL = IS_MAC ? "⌃" : "Ctrl+";
@@ -928,6 +1116,7 @@ export const KEYBINDINGS: KeybindingRow[] = [
     when: "Always",
   },
   { command: "App: Switch Model", keys: `${MOD}.`, when: "Always" },
+  { command: "App: Toggle Mono", keys: `${MOD}I`, when: "Project with a mono" },
   {
     command: "Composer: Toggle Workspace",
     keys: `${MOD}${SHIFT}G`,
@@ -1074,9 +1263,7 @@ function defaultShortcutsFor(command: string): string[] {
     return value ? [value] : [];
   };
   if (row.keys.includes("…")) {
-    return [1, 2, 3, 4, 5, 6, 7, 8].flatMap((digit) =>
-      chords(`Digit${digit}`),
-    );
+    return [1, 2, 3, 4, 5, 6, 7, 8].flatMap((digit) => chords(`Digit${digit}`));
   }
   if (/^[A-Za-z]$/.test(rest)) return chords(`Key${rest.toUpperCase()}`);
   if (/^[0-9]$/.test(rest)) return chords(`Digit${rest}`);
@@ -1096,9 +1283,7 @@ function shortcutOwners(): Map<string, string> {
         : defaultShortcutsFor(row.command);
     for (const chord of chords) owners.set(chord, row.command);
   }
-  for (const [command, override] of Object.entries(
-    loadKeybindingOverrides(),
-  )) {
+  for (const [command, override] of Object.entries(loadKeybindingOverrides())) {
     if (override.shortcut) owners.set(override.shortcut, command);
   }
   return owners;
@@ -1249,9 +1434,7 @@ export function keybindingShortcutTokens(
 ): string | null {
   const override = loadKeybindingOverrides()[command];
   if (override?.disabled) return null;
-  return override?.shortcut
-    ? shortcutTokens(override.shortcut)
-    : fallback;
+  return override?.shortcut ? shortcutTokens(override.shortcut) : fallback;
 }
 
 export function subscribeKeybindings(onStoreChange: () => void) {

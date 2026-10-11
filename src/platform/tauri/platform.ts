@@ -10,8 +10,14 @@ export const IS_WEB =
 export const IS_WIN =
   typeof navigator !== "undefined" && /Win/i.test(navigator.platform);
 
-/** Native desktop blur: macOS vibrancy and Windows acrylic. Linux stays opaque. */
-export const HAS_NATIVE_GLASS = (IS_MAC || IS_WIN) && !IS_WEB;
+export const IS_LINUX =
+  typeof navigator !== "undefined" && /Linux/i.test(navigator.platform);
+
+/**
+ * Native desktop blur on macOS/Windows; transparency-only glass on Linux.
+ * None in a browser.
+ */
+export const HAS_NATIVE_GLASS = (IS_MAC || IS_WIN || IS_LINUX) && !IS_WEB;
 
 export const MOD = IS_MAC ? "⌘" : "Ctrl+";
 export const ALT = IS_MAC ? "⌥" : "Alt+";

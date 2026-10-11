@@ -6,9 +6,7 @@ use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
-#[cfg(not(windows))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -39,6 +37,14 @@ struct HarnessLine {
     line: String,
 }
 
+/// Stdout lines in arrival order; one event carries every line from a window.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct HarnessLines {
+    session_id: String,
+    lines: Vec<String>,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct HarnessExit {
@@ -49,9 +55,59 @@ struct HarnessExit {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct HarnessSse {
+struct HarnessSseBatch {
     session_id: String,
-    data: String,
+    events: Vec<String>,
+}
+
+/// Each `emit` is a JS eval in every window, and a streaming agent prints a
+/// line per token. Coalesce to about one hop per frame, like `pty-data`.
+const OUTPUT_COALESCE: Duration = Duration::from_millis(16);
+/// A huge tool result shouldn't hold back the lines queued behind it.
+const OUTPUT_BATCH_BYTES: usize = 1 << 20;
+/// How long an exit waits for its last output. A grandchild that inherited
+/// stdout can hold the pipe open after the agent itself has gone.
+const OUTPUT_DRAIN_WAIT: Duration = Duration::from_millis(500);
+
+/// Hands `emit` batches of the items sent on the returned channel. After an
+/// idle stretch the first item goes out at once; a burst then waits out the
+/// rest of the window. The receiver fires once everything sent has gone out.
+fn spawn_output_batcher<F>(mut emit: F) -> (mpsc::Sender<String>, mpsc::Receiver<()>)
+where
+    F: FnMut(Vec<String>) + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<String>();
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut last_emit: Option<Instant> = None;
+        while let Ok(first) = rx.recv() {
+            let mut bytes = first.len();
+            let mut batch = vec![first];
+            if let Some(deadline) = last_emit.map(|at| at + OUTPUT_COALESCE) {
+                while bytes < OUTPUT_BATCH_BYTES {
+                    let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    match rx.recv_timeout(wait) {
+                        Ok(item) => {
+                            bytes += item.len();
+                            batch.push(item);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            while bytes < OUTPUT_BATCH_BYTES {
+                let Ok(item) = rx.try_recv() else { break };
+                bytes += item.len();
+                batch.push(item);
+            }
+            emit(batch);
+            last_emit = Some(Instant::now());
+        }
+        let _ = done_tx.send(());
+    });
+    (tx, done_rx)
 }
 
 #[derive(Serialize, Clone)]
@@ -121,6 +177,16 @@ pub struct HarnessHost {
 }
 
 impl HarnessHost {
+    pub(crate) fn runtime_binary_path(&self, provider: &str) -> Option<String> {
+        self.runtime_binary_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()?
+            .get(provider)
+            .map(|path| path.trim().to_owned())
+            .filter(|path| !path.is_empty())
+    }
+
     pub(crate) fn has_working_dir(&self, path: &Path) -> bool {
         self.lock_inner()
             .children
@@ -361,6 +427,366 @@ pub fn harness_resolve_claude() -> Result<CursorBinary, String> {
         })
 }
 
+fn resolve_mcp_binary(provider: &str, binary_path: Option<&str>) -> Result<PathBuf, String> {
+    if !matches!(provider, "claude" | "codex" | "cursor" | "opencode") {
+        return Err("Unsupported MCP provider".into());
+    }
+    match binary_path {
+        Some(path) => resolve_harness_binary_override(provider, path),
+        None => resolve_harness_binary_default(provider)
+            .ok_or_else(|| format!("{provider} CLI not found")),
+    }
+}
+
+fn claude_mcp_command(
+    args: Vec<String>,
+    cwd: String,
+    timeout: Duration,
+    binary_path: Option<&str>,
+) -> Result<String, String> {
+    let binary = resolve_mcp_binary("claude", binary_path)?;
+    mcp_command(binary, args, cwd, timeout)
+}
+
+fn mcp_command(
+    binary: PathBuf,
+    args: Vec<String>,
+    cwd: String,
+    timeout: Duration,
+) -> Result<String, String> {
+    let workdir = expand_home(&cwd);
+    if !workdir.is_dir() {
+        return Err("Project directory does not exist".into());
+    }
+    let output = exec_output(&binary.to_string_lossy(), &args, Some(&cwd), timeout)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("{} {}", stderr.trim(), stdout).trim().to_string())
+}
+
+#[tauri::command]
+pub async fn claude_mcp_list(host: State<'_, HarnessHost>, cwd: String) -> Result<String, String> {
+    let binary_path = host.runtime_binary_path("claude");
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut output = claude_mcp_command(
+            vec!["mcp".into(), "list".into()],
+            cwd.clone(),
+            Duration::from_secs(30),
+            binary_path.as_deref(),
+        )?;
+        for name in configured_ws_mcp_servers(&expand_home(&cwd)) {
+            if !output
+                .lines()
+                .any(|line| line.starts_with(&format!("{name}:")))
+            {
+                output.push_str(&format!(
+                    "\n{name}: WebSocket server (open Claude /mcp for status)"
+                ));
+            }
+        }
+        Ok(output)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let read = |path: &Path| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    };
+    let collect = |servers: Option<&serde_json::Value>, names: &mut Vec<String>| {
+        if let Some(servers) = servers.and_then(serde_json::Value::as_object) {
+            for (name, config) in servers {
+                if config.get("type").and_then(serde_json::Value::as_str) == Some("ws")
+                    && valid_mcp_name(name)
+                    && !names.contains(name)
+                {
+                    names.push(name.clone());
+                }
+            }
+        }
+    };
+    if let Some(home) = dirs_home() {
+        if let Some(settings) = read(&Path::new(&home).join(".claude.json")) {
+            collect(settings.get("mcpServers"), &mut names);
+            collect(
+                settings
+                    .get("projects")
+                    .and_then(|projects| projects.get(cwd.to_string_lossy().as_ref()))
+                    .and_then(|project| project.get("mcpServers")),
+                &mut names,
+            );
+        }
+    }
+    for directory in cwd.ancestors() {
+        if let Some(settings) = read(&directory.join(".mcp.json")) {
+            collect(settings.get("mcpServers"), &mut names);
+        }
+        if directory.join(".git").exists() {
+            break;
+        }
+    }
+    names
+}
+
+#[tauri::command]
+pub async fn claude_mcp_add(
+    host: State<'_, HarnessHost>,
+    cwd: String,
+    name: String,
+    config: String,
+    scope: String,
+) -> Result<(), String> {
+    if !valid_mcp_name(&name) {
+        return Err("Server name must use letters, numbers, hyphens, or underscores".into());
+    }
+    if !matches!(scope.as_str(), "local" | "project" | "user") {
+        return Err("Invalid MCP scope".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(&config).map_err(|e| e.to_string())?;
+    if !value.is_object() {
+        return Err("Server configuration must be a JSON object".into());
+    }
+    let binary_path = host.runtime_binary_path("claude");
+    tauri::async_runtime::spawn_blocking(move || {
+        claude_mcp_command(
+            vec![
+                "mcp".into(),
+                "add-json".into(),
+                name,
+                config,
+                "--scope".into(),
+                scope,
+            ],
+            cwd,
+            Duration::from_secs(30),
+            binary_path.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(())
+}
+
+pub(crate) fn add_mcp_via_cli(
+    provider: &str,
+    scope: &str,
+    cwd: &str,
+    name: &str,
+    config: &serde_json::Value,
+    binary_path: Option<&str>,
+) -> Result<(), String> {
+    let (binary, args) = mcp_add_args(provider, scope, name, config, binary_path)?;
+    mcp_command(binary, args, cwd.to_owned(), Duration::from_secs(30))?;
+    Ok(())
+}
+
+pub(crate) fn opencode_major_version(cwd: &str, binary_path: Option<&str>) -> Result<u32, String> {
+    let binary = resolve_mcp_binary("opencode", binary_path)?;
+    let version = mcp_command(
+        binary,
+        vec!["--version".into()],
+        cwd.to_owned(),
+        Duration::from_secs(10),
+    )?;
+    version
+        .split_whitespace()
+        .find_map(|part| {
+            part.trim_start_matches('v')
+                .split('.')
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
+        .filter(|major| matches!(major, 1 | 2))
+        .ok_or_else(|| format!("Unsupported OpenCode version: {version}"))
+}
+
+fn mcp_add_args(
+    provider: &str,
+    scope: &str,
+    name: &str,
+    config: &serde_json::Value,
+    binary_path: Option<&str>,
+) -> Result<(PathBuf, Vec<String>), String> {
+    if provider == "claude" {
+        if !matches!(scope, "local" | "project" | "user") {
+            return Err("Invalid Claude MCP scope".into());
+        }
+        let binary = resolve_mcp_binary("claude", binary_path)?;
+        let config = serde_json::to_string(config).map_err(|e| e.to_string())?;
+        return Ok((
+            binary,
+            vec![
+                "mcp".into(),
+                "add-json".into(),
+                name.into(),
+                config,
+                "--scope".into(),
+                scope.into(),
+            ],
+        ));
+    }
+    if provider == "codex" && scope != "user" {
+        return Err("Codex CLI adds user-scoped servers only".into());
+    }
+    let binary = match provider {
+        "codex" => resolve_mcp_binary("codex", binary_path)?,
+        _ => return Err("Unsupported MCP provider".into()),
+    };
+    let object = config
+        .as_object()
+        .ok_or("Server configuration must be an object")?;
+    let remote = object.get("url").and_then(serde_json::Value::as_str);
+    let allowed: &[&str] = if remote.is_some() {
+        &["type", "url", "bearerTokenEnvVar"]
+    } else {
+        &["type", "command", "args", "env"]
+    };
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!(
+            "{provider} add cannot preserve '{key}'; edit its config file instead"
+        ));
+    }
+    let kind = object.get("type").and_then(serde_json::Value::as_str);
+    if remote.is_some() && !matches!(kind, None | Some("http") | Some("remote")) {
+        return Err(format!("{provider} CLI supports HTTP URLs only"));
+    }
+    if remote.is_none() && !matches!(kind, None | Some("stdio") | Some("local")) {
+        return Err("Local server type must be stdio".into());
+    }
+    let mut args = vec!["mcp".into(), "add".into(), name.into()];
+    if let Some(url) = remote {
+        let parsed = url::Url::parse(url).map_err(|_| "Invalid server URL")?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("MCP URL must use HTTP or HTTPS".into());
+        }
+        args.extend(["--url".into(), url.into()]);
+        if let Some(var) = object
+            .get("bearerTokenEnvVar")
+            .and_then(serde_json::Value::as_str)
+        {
+            args.extend(["--bearer-token-env-var".into(), var.into()]);
+        }
+    } else {
+        args.extend(mcp_key_values(config, "env", "--env")?);
+        let command = object
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("Local server needs a command")?;
+        let parameters = object
+            .get("args")
+            .map(|value| value.as_array().ok_or("args must be an array"))
+            .transpose()?;
+        args.push("--".into());
+        args.push(command.into());
+        for parameter in parameters.into_iter().flatten() {
+            args.push(
+                parameter
+                    .as_str()
+                    .ok_or("args must contain strings")?
+                    .into(),
+            );
+        }
+    }
+    Ok((binary, args))
+}
+
+fn mcp_key_values(
+    config: &serde_json::Value,
+    field: &str,
+    flag: &str,
+) -> Result<Vec<String>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_object()
+        .ok_or_else(|| format!("{field} must be an object"))?;
+    let mut args = Vec::new();
+    for (key, value) in values {
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("{field} values must be strings"))?;
+        args.extend([flag.to_owned(), format!("{key}={value}")]);
+    }
+    Ok(args)
+}
+
+#[tauri::command]
+pub async fn claude_mcp_remove(
+    host: State<'_, HarnessHost>,
+    cwd: String,
+    name: String,
+    scope: String,
+) -> Result<(), String> {
+    if !valid_mcp_name(&name) {
+        return Err("Invalid MCP server name".into());
+    }
+    if !matches!(scope.as_str(), "local" | "project" | "user") {
+        return Err("Invalid MCP scope".into());
+    }
+    let binary_path = host.runtime_binary_path("claude");
+    tauri::async_runtime::spawn_blocking(move || {
+        claude_mcp_command(
+            vec!["mcp".into(), "remove".into(), name, "--scope".into(), scope],
+            cwd,
+            Duration::from_secs(30),
+            binary_path.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn mcp_provider_login(
+    host: State<'_, HarnessHost>,
+    cwd: String,
+    provider: String,
+    name: String,
+) -> Result<(), String> {
+    let valid_name = if provider == "opencode" {
+        !name.trim().is_empty() && !name.chars().any(char::is_control)
+    } else {
+        valid_mcp_name(&name)
+    };
+    if !valid_name {
+        return Err("Invalid MCP server name".into());
+    }
+    let binary_path = host.runtime_binary_path(&provider);
+    tauri::async_runtime::spawn_blocking(move || {
+        let args = match provider.as_str() {
+            "claude" | "codex" | "cursor" => vec!["mcp", "login"],
+            "opencode" => vec!["mcp", "auth"],
+            _ => return Err("Unsupported MCP provider".into()),
+        };
+        let binary = resolve_mcp_binary(&provider, binary_path.as_deref())?;
+        mcp_command(
+            binary,
+            args.into_iter().map(String::from).chain([name]).collect(),
+            cwd,
+            Duration::from_secs(180),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn valid_mcp_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Resolve the Pi coding agent CLI (`pi`).
 #[tauri::command(async)]
 pub fn harness_resolve_pi() -> Result<CursorBinary, String> {
@@ -424,6 +850,19 @@ pub fn harness_resolve_hermes() -> Result<CursorBinary, String> {
         })
 }
 
+/// Resolve Cognition's Devin CLI (`devin`).
+#[tauri::command(async)]
+pub fn harness_resolve_devin() -> Result<CursorBinary, String> {
+    resolve_devin()
+        .map(|path| CursorBinary {
+            path: path.to_string_lossy().into_owned(),
+        })
+        .ok_or_else(|| {
+            "Devin CLI not found. Install it with `curl -fsSL https://cli.devin.ai/install.sh | bash` (Windows: `irm https://static.devin.ai/cli/setup.ps1 | iex`) and run `devin auth login`, then retry."
+                .into()
+        })
+}
+
 /// Antigravity's ACP server is separate from the interactive agy CLI.
 #[tauri::command(async)]
 pub fn harness_resolve_antigravity() -> Result<AntigravityBinary, String> {
@@ -461,6 +900,8 @@ pub fn harness_spawn(
     account: Option<HarnessAccount>,
     binary_provider: Option<String>,
     binary_path: Option<String>,
+    codex_store: Option<String>,
+    devin_ask_edits: Option<bool>,
 ) -> Result<u32, String> {
     let workdir = expand_home(&cwd);
     if !workdir.is_dir() {
@@ -473,6 +914,15 @@ pub fn harness_spawn(
         return Err("harness_spawn: not a resolved harness CLI".to_string());
     }
 
+    // `--config` is a global option, so it precedes the `acp` subcommand.
+    let devin_config = match devin_ask_edits {
+        None | Some(false) => Vec::new(),
+        Some(true) if binary_provider.as_deref() == Some("devin") && args == ["acp"] => {
+            crate::devin_config::supervised_args(&app)?
+        }
+        Some(true) => return Err("Edit approvals are only supported for `devin acp`".into()),
+    };
+
     let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
     let (epoch, kill_all, prev) = host.begin_spawn(&session_id);
     if let Some(prev) = prev {
@@ -480,13 +930,35 @@ pub fn harness_spawn(
     }
 
     let mut cmd = Command::new(&command);
-    cmd.args(&args)
+    cmd.args(&devin_config)
+        .args(&args)
         .current_dir(&workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, &command);
     apply_provider_account(&app, &mut cmd, account.as_ref())?;
+    let codex_store = match codex_store.as_deref() {
+        None => None,
+        Some("mono")
+            if binary_provider.as_deref() == Some("codex")
+                && account.as_ref().is_some_and(|a| a.provider == "codex")
+                && args.first().is_some_and(|a| a == "app-server") =>
+        {
+            let store =
+                crate::codex_mono_store::prepare(&app, account.as_ref().map(|a| a.id.as_str()))?;
+            let private_path = serde_json::to_string(&store.home).map_err(|e| e.to_string())?;
+            // Explicit config takes precedence over CODEX_SQLITE_HOME. Override
+            // both so a user's sqlite_home cannot index Monos in the Codex app.
+            cmd.env("CODEX_HOME", &store.home)
+                .env("CODEX_SQLITE_HOME", &store.home)
+                .args(["-c", &format!("sqlite_home={private_path}")]);
+            Some(Arc::new(store))
+        }
+        Some(_) => {
+            return Err("Private Mono storage is only supported for Codex app-server".into())
+        }
+    };
 
     crate::control::configure_child(&app, &session_id, &mut cmd);
 
@@ -527,16 +999,31 @@ pub fn harness_spawn(
 
     let stdout_app = app.clone();
     let stdout_id = session_id.clone();
+    let (stdout_tx, stdout_drained) = spawn_output_batcher(move |lines| {
+        let _ = stdout_app.emit(
+            STDOUT_EVENT,
+            HarnessLines {
+                session_id: stdout_id.clone(),
+                lines,
+            },
+        );
+    });
+    let wait_store = codex_store.clone();
+    let stdout_store = codex_store;
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            let _ = stdout_app.emit(
-                STDOUT_EVENT,
-                HarnessLine {
-                    session_id: stdout_id.clone(),
-                    line,
-                },
-            );
+            if let Some(store) = &stdout_store {
+                if line.contains("\"turn/completed\"")
+                    || line.contains("\"item/started\"")
+                    || line.contains("\"account/updated\"")
+                {
+                    store.sync_auth();
+                }
+            }
+            if stdout_tx.send(line).is_err() {
+                break;
+            }
         }
     });
 
@@ -560,6 +1047,11 @@ pub fn harness_spawn(
     let wait_pid = pid;
     thread::spawn(move || {
         let code = child.wait().ok().and_then(|status| status.code());
+        // Deliver the final batched lines before the exit that follows them.
+        let _ = stdout_drained.recv_timeout(OUTPUT_DRAIN_WAIT);
+        if let Some(store) = wait_store {
+            store.sync_auth();
+        }
         if let Some(host) = wait_app.try_state::<HarnessHost>() {
             if host.remove_if_pid(&wait_id, wait_pid).is_some() {
                 host.stop_sse(&wait_id);
@@ -811,7 +1303,22 @@ pub fn harness_sse_open(
         match result {
             Ok(response) => {
                 let reader = BufReader::new(response.into_reader());
-                read_sse(reader, &app, &session_id, &stop);
+                let events_app = app.clone();
+                let events_id = session_id.clone();
+                let (tx, drained) = spawn_output_batcher(move |events| {
+                    let _ = events_app.emit(
+                        SSE_EVENT,
+                        HarnessSseBatch {
+                            session_id: events_id.clone(),
+                            events,
+                        },
+                    );
+                });
+                read_sse(reader, &stop, |data| {
+                    let _ = tx.send(data);
+                });
+                drop(tx);
+                let _ = drained.recv();
                 emit_sse_end(&app, &session_id, None);
             }
             Err(error) => {
@@ -841,7 +1348,7 @@ fn read_http_response(response: ureq::Response) -> Result<HarnessHttpResponse, S
     Ok(HarnessHttpResponse { status, body })
 }
 
-fn read_sse<R: BufRead>(reader: R, app: &AppHandle, session_id: &str, stop: &AtomicBool) {
+fn read_sse<R: BufRead>(reader: R, stop: &AtomicBool, mut send: impl FnMut(String)) {
     let mut data = String::new();
     for line in reader.lines() {
         if stop.load(Ordering::SeqCst) {
@@ -855,14 +1362,7 @@ fn read_sse<R: BufRead>(reader: R, app: &AppHandle, session_id: &str, stop: &Ato
             if data.is_empty() {
                 continue;
             }
-            let payload = std::mem::take(&mut data);
-            let _ = app.emit(
-                SSE_EVENT,
-                HarnessSse {
-                    session_id: session_id.to_string(),
-                    data: payload,
-                },
-            );
+            send(std::mem::take(&mut data));
             continue;
         }
         if let Some(rest) = line.strip_prefix("data:") {
@@ -907,15 +1407,32 @@ const EXEC_ALLOWED_ARGS: &[&[&str]] = &[
     &["agent", "list"],
 ];
 
-fn exec_args_allowed(args: &[String]) -> bool {
-    EXEC_ALLOWED_ARGS
-        .iter()
-        .any(|a| a.len() == args.len() && a.iter().zip(args).all(|(x, y)| x == y))
+// OpenCode 2.x runs as a background service; other providers' CLIs may give
+// these subcommands unrelated meanings, so they stay OpenCode-only.
+const OPENCODE_EXEC_ALLOWED_ARGS: &[&[&str]] = &[
+    &["service", "status"],
+    &["service", "start"],
+    &["service", "get", "password"],
+];
+
+fn exec_args_allowed(binary_provider: Option<&str>, args: &[String]) -> bool {
+    let matches = |a: &&[&str]| a.len() == args.len() && a.iter().zip(args).all(|(x, y)| x == y);
+    EXEC_ALLOWED_ARGS.iter().any(matches)
+        || (binary_provider == Some("opencode") && OPENCODE_EXEC_ALLOWED_ARGS.iter().any(matches))
+        // Devin reads its login location from `auth status`.
+        || (binary_provider == Some("devin") && matches(&&["auth", "status"][..]))
+        || (binary_provider == Some("grok")
+            && args.len() == 4
+            && args[0] == "--no-auto-update"
+            && args[1] == "sessions"
+            && args[2] == "delete"
+            && args[3].len() == 36
+            && uuid::Uuid::parse_str(&args[3]).is_ok())
 }
 
 /// Must be a path a resolver would hand back, not an arbitrary binary
 /// that merely shares a file name.
-fn is_resolved_harness_binary(
+pub(crate) fn is_resolved_harness_binary(
     command: &str,
     binary_provider: Option<&str>,
     binary_path: Option<&str>,
@@ -931,7 +1448,7 @@ fn is_resolved_harness_binary(
     resolved.is_ok_and(|path| path == Path::new(command))
 }
 
-/// One-shot capture of stdout (used for `cursor-agent --list-models`).
+/// One-shot provider commands: catalog probes and temporary-session cleanup.
 #[tauri::command]
 pub async fn harness_exec(
     command: String,
@@ -940,7 +1457,7 @@ pub async fn harness_exec(
     binary_provider: Option<String>,
     binary_path: Option<String>,
 ) -> Result<String, String> {
-    if !exec_args_allowed(&args) {
+    if !exec_args_allowed(binary_provider.as_deref(), &args) {
         return Err("harness_exec: unsupported arguments".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -955,6 +1472,23 @@ pub async fn harness_exec(
 }
 
 fn exec_capture(command: &str, args: &[String], cwd: Option<&str>) -> Result<String, String> {
+    let output = exec_output(command, args, cwd, EXEC_TIMEOUT)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if output.status.success() || !stdout.trim().is_empty() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(stderr.trim().to_string())
+}
+
+const EXEC_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) fn exec_output(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     let mut cmd = Command::new(command);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -975,15 +1509,8 @@ fn exec_capture(command: &str, args: &[String], cwd: Option<&str>) -> Result<Str
         let _ = tx.send(child.wait_with_output());
     });
 
-    match rx.recv_timeout(Duration::from_secs(15)) {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            if output.status.success() || !stdout.trim().is_empty() {
-                return Ok(stdout);
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(stderr.trim().to_string())
-        }
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Ok(output),
         Ok(Err(e)) => Err(format!("Failed to run {command}: {e}")),
         Err(_) => {
             terminate(pid);
@@ -1296,6 +1823,7 @@ fn is_harness_argv_token(part: &str) -> bool {
             | "omp"
             | "fx"
             | "hermes"
+            | "devin"
             | "agy_acp_server.par"
             | "pi"
             | "worker-server"
@@ -1536,6 +2064,7 @@ fn resolve_harness_binary_default(provider: &str) -> Option<PathBuf> {
         "fx" => resolve_fx(),
         "hermes" => resolve_hermes(),
         "antigravity" => resolve_antigravity(),
+        "devin" => resolve_devin(),
         _ => None,
     }
 }
@@ -1581,6 +2110,7 @@ fn resolve_harness_binary_override(provider: &str, binary_path: &str) -> Result<
         "fx" => &["fx"],
         "hermes" => &["hermes"],
         "antigravity" => &["agy_acp_server.par"],
+        "devin" => &["devin"],
         _ => {
             return Err(format!(
                 "Unsupported configured harness provider: {provider}"
@@ -1653,6 +2183,7 @@ fn validate_harness_binary_version(provider: &str, path: &Path) -> Result<(), St
         "claude" => lower.contains("claude"),
         "codex" => lower.contains("codex"),
         "hermes" => lower.contains("hermes"),
+        "devin" => lower.contains("devin"),
         _ => true,
     };
     if has_version && provider_marker {
@@ -1716,10 +2247,16 @@ fn validate_configured_harness_binary_identity(
     }
 }
 
+/// Prefers whatever `codex` the user's own shell resolves, like
+/// `resolve_claude`. Trying `~/.local/bin/codex` first picks the ChatGPT app's
+/// wrapper, pinned to an older bundled CLI, over a newer Homebrew or npm install.
 fn resolve_codex() -> Option<PathBuf> {
     let home = dirs_home().map(PathBuf::from);
     let mut candidates: Vec<PathBuf> = Vec::new();
 
+    if let Some(from_shell) = which_via_login_shell("codex") {
+        candidates.push(from_shell);
+    }
     if let Some(home) = &home {
         candidates.push(home.join(".local/bin/codex"));
         candidates.push(home.join(".bun/bin/codex"));
@@ -1731,9 +2268,6 @@ fn resolve_codex() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/bin/codex"));
     candidates.push(PathBuf::from("/usr/bin/codex"));
     candidates.push(PathBuf::from("/snap/bin/codex"));
-    if let Some(from_shell) = which_via_login_shell("codex") {
-        candidates.push(from_shell);
-    }
 
     // Last resort: the Codex app bundles its own CLI, but never puts it on
     // PATH. It is pinned to the app release (often a prerelease), so a real
@@ -1939,6 +2473,30 @@ fn resolve_hermes() -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/bin/hermes"));
     candidates.push(PathBuf::from("/snap/bin/hermes"));
     if let Some(from_shell) = which_via_login_shell("hermes") {
+        candidates.push(from_shell);
+    }
+
+    first_binary(candidates)
+}
+
+fn resolve_devin() -> Option<PathBuf> {
+    let home = dirs_home().map(PathBuf::from);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(home) = &home {
+        // Official installer target on macOS and Linux.
+        candidates.push(home.join(".local/bin/devin"));
+    }
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        // The Windows installer keeps its launcher beside versioned builds.
+        candidates.push(local_app_data.join("devin/cli/bin/devin"));
+    }
+    #[cfg(target_os = "macos")]
+    candidates.push(PathBuf::from("/opt/homebrew/bin/devin"));
+    candidates.push(PathBuf::from("/usr/local/bin/devin"));
+    candidates.push(PathBuf::from("/usr/bin/devin"));
+    if let Some(from_shell) = which_via_login_shell("devin") {
         candidates.push(from_shell);
     }
 
@@ -2889,6 +3447,106 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn mcp_commands_use_active_configured_binaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("monocode-mcp-binaries-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let host = HarnessHost::new();
+        let mut paths = HashMap::new();
+        for (provider, filename) in [
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("cursor", "cursor-agent"),
+            ("opencode", "opencode"),
+        ] {
+            let binary = root.join(filename);
+            std::fs::write(
+                &binary,
+                format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{provider} 2.3.4'; else printf '%s\\n' \"$@\"; fi\n"),
+            ).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            paths.insert(provider.to_string(), binary.to_string_lossy().into_owned());
+        }
+        initialize_runtime_binary_paths(&host.runtime_binary_paths, paths.clone());
+        initialize_runtime_binary_paths(&host.runtime_binary_paths, HashMap::new());
+        let cwd = root.to_string_lossy().into_owned();
+        for (provider, path) in &paths {
+            let active = host.runtime_binary_path(provider).unwrap();
+            assert_eq!(&active, path);
+            let binary = resolve_mcp_binary(provider, Some(&active)).unwrap();
+            assert_eq!(binary, PathBuf::from(path));
+            assert_eq!(
+                mcp_command(
+                    binary,
+                    vec!["mcp".into(), "login".into(), "docs".into()],
+                    cwd.clone(),
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+                "mcp\nlogin\ndocs"
+            );
+        }
+        assert_eq!(
+            claude_mcp_command(
+                vec!["mcp".into(), "list".into()],
+                cwd.clone(),
+                Duration::from_secs(5),
+                paths.get("claude").map(String::as_str),
+            )
+            .unwrap(),
+            "mcp\nlist"
+        );
+        for provider in ["claude", "codex"] {
+            let config = serde_json::json!({"command":"node","args":["docs"]});
+            let (binary, args) = mcp_add_args(
+                provider,
+                "user",
+                "docs",
+                &config,
+                paths.get(provider).map(String::as_str),
+            )
+            .unwrap();
+            assert_eq!(binary, PathBuf::from(&paths[provider]));
+            assert_eq!(
+                &args[..3],
+                [
+                    "mcp",
+                    if provider == "claude" {
+                        "add-json"
+                    } else {
+                        "add"
+                    },
+                    "docs"
+                ]
+            );
+            add_mcp_via_cli(
+                provider,
+                "user",
+                &cwd,
+                "docs",
+                &config,
+                paths.get(provider).map(String::as_str),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            opencode_major_version(&cwd, paths.get("opencode").map(String::as_str)),
+            Ok(2)
+        );
+        assert!(resolve_mcp_binary(
+            "claude",
+            Some(&root.join("missing/claude").to_string_lossy())
+        )
+        .is_err());
+        assert!(resolve_mcp_binary("claude", paths.get("codex").map(String::as_str)).is_err());
+        assert!(resolve_mcp_binary("pi", paths.get("claude").map(String::as_str)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn configured_binary_paths_fail_closed_and_stay_exact() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3273,6 +3931,74 @@ mod tests {
 }
 
 #[cfg(test)]
+mod output_batcher_tests {
+    use super::*;
+
+    type Batches = Arc<Mutex<Vec<Vec<String>>>>;
+
+    fn collect() -> (mpsc::Sender<String>, mpsc::Receiver<()>, Batches) {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let sink = batches.clone();
+        let (tx, drained) = spawn_output_batcher(move |batch| sink.lock().unwrap().push(batch));
+        (tx, drained, batches)
+    }
+
+    #[test]
+    fn an_idle_stream_sends_its_first_line_at_once() {
+        let (tx, _drained, batches) = collect();
+        tx.send("first".into()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while batches.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(*batches.lock().unwrap(), vec![vec!["first".to_string()]]);
+    }
+
+    #[test]
+    fn a_burst_shares_one_event_and_drains_before_done() {
+        let (tx, drained, batches) = collect();
+        tx.send("lead".into()).unwrap();
+        while batches.lock().unwrap().is_empty() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        for i in 0..100 {
+            tx.send(format!("line {i}")).unwrap();
+        }
+        drop(tx);
+        drained.recv_timeout(Duration::from_secs(5)).unwrap();
+        let batches = batches.lock().unwrap();
+        assert!(batches.len() <= 3, "{} batches", batches.len());
+        let lines: Vec<String> = batches.iter().flatten().cloned().collect();
+        let expected: Vec<String> = std::iter::once("lead".to_string())
+            .chain((0..100).map(|i| format!("line {i}")))
+            .collect();
+        assert_eq!(lines, expected);
+    }
+
+    #[test]
+    fn a_large_line_closes_its_batch() {
+        let (tx, drained, batches) = collect();
+        tx.send("x".repeat(OUTPUT_BATCH_BYTES)).unwrap();
+        tx.send("after".into()).unwrap();
+        drop(tx);
+        drained.recv_timeout(Duration::from_secs(5)).unwrap();
+        let batches = batches.lock().unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[1], vec!["after".to_string()]);
+    }
+
+    #[test]
+    fn sse_events_split_on_blank_lines() {
+        let stream = ": ping\ndata: one\n\ndata: two\ndata: lines\n\n";
+        let mut events = Vec::new();
+        read_sse(stream.as_bytes(), &AtomicBool::new(false), |data| {
+            events.push(data)
+        });
+        assert_eq!(events, vec!["one".to_string(), "two\nlines".to_string()]);
+    }
+}
+
+#[cfg(test)]
 mod exec_allowlist_tests {
     use super::*;
 
@@ -3282,22 +4008,66 @@ mod exec_allowlist_tests {
 
     #[test]
     fn allows_known_catalog_args() {
-        assert!(exec_args_allowed(&args(&["--version"])));
-        assert!(exec_args_allowed(&args(&["--list-models"])));
-        assert!(exec_args_allowed(&args(&["models", "--verbose"])));
-        assert!(exec_args_allowed(&args(&["models", "--json"])));
-        assert!(exec_args_allowed(&args(&["models"])));
-        assert!(exec_args_allowed(&args(&["status", "--json"])));
-        assert!(exec_args_allowed(&args(&["agent", "list"])));
+        for provider in [None, Some("cursor"), Some("opencode")] {
+            assert!(exec_args_allowed(provider, &args(&["--version"])));
+            assert!(exec_args_allowed(provider, &args(&["--list-models"])));
+            assert!(exec_args_allowed(provider, &args(&["models", "--verbose"])));
+            assert!(exec_args_allowed(provider, &args(&["models", "--json"])));
+            assert!(exec_args_allowed(provider, &args(&["models"])));
+            assert!(exec_args_allowed(provider, &args(&["status", "--json"])));
+            assert!(exec_args_allowed(provider, &args(&["agent", "list"])));
+        }
+    }
+
+    #[test]
+    fn allows_service_args_only_for_opencode() {
+        for service in [
+            &["service", "status"][..],
+            &["service", "start"][..],
+            &["service", "get", "password"][..],
+        ] {
+            assert!(exec_args_allowed(Some("opencode"), &args(service)));
+            assert!(!exec_args_allowed(None, &args(service)));
+            assert!(!exec_args_allowed(Some("cursor"), &args(service)));
+        }
+    }
+
+    #[test]
+    fn allows_grok_cleanup_only_for_one_valid_session_id() {
+        let cleanup = args(&[
+            "--no-auto-update",
+            "sessions",
+            "delete",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ]);
+        assert!(exec_args_allowed(Some("grok"), &cleanup));
+        for provider in [None, Some("cursor"), Some("opencode")] {
+            assert!(!exec_args_allowed(provider, &cleanup));
+        }
+        for id in ["", "--all", "../sessions", "invalid"] {
+            let mut rejected = cleanup.clone();
+            rejected[3] = id.to_string();
+            assert!(!exec_args_allowed(Some("grok"), &rejected));
+        }
+        let mut extra = cleanup;
+        extra.push("--all".to_string());
+        assert!(!exec_args_allowed(Some("grok"), &extra));
     }
 
     #[test]
     fn rejects_other_args() {
-        assert!(!exec_args_allowed(&args(&[])));
-        assert!(!exec_args_allowed(&args(&["--help"])));
-        assert!(!exec_args_allowed(&args(&["--version", "--json"])));
-        assert!(!exec_args_allowed(&args(&["-c", "id"])));
-        assert!(!exec_args_allowed(&args(&["agent", "list", "--json"])));
+        for rejected in [
+            &[][..],
+            &["--help"][..],
+            &["--version", "--json"][..],
+            &["-c", "id"][..],
+            &["agent", "list", "--json"][..],
+            &["service", "stop"][..],
+            &["service", "get"][..],
+            &["service", "status", "--json"][..],
+        ] {
+            assert!(!exec_args_allowed(Some("opencode"), &args(rejected)));
+        }
     }
 }
 
@@ -3436,6 +4206,7 @@ mod reap_logic_tests {
         ));
         assert!(looks_like_harness_argv("/Users/n/.local/bin/claude --help"));
         assert!(looks_like_harness_argv("/Users/n/.local/bin/hermes acp"));
+        assert!(looks_like_harness_argv("/Users/n/.local/bin/devin acp"));
         assert!(!looks_like_harness_argv("tmux new -s work"));
         assert!(!looks_like_harness_argv("npm start"));
         assert!(!looks_like_harness_argv(

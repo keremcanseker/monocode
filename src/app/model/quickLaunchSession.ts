@@ -41,6 +41,7 @@ export async function acceptQuickLaunch(
       sessionId: string,
       text: string,
       attachments: Attachment[],
+      options?: { intent: "plan" | "orchestrate" },
     ) => SubmissionAcceptance;
     saveDraft?: (
       sessionId: string,
@@ -50,6 +51,8 @@ export async function acceptQuickLaunch(
     ) => SubmissionAcceptance;
   },
   placement?: { direction: SplitDir; besideSessionId: string },
+  /** Off for a session followed elsewhere, such as from the Mono that ran it. */
+  openTab = true,
 ): Promise<void> {
   // Rehydrate image previews in this webview; the floating panel sends paths.
   const attachments = await prepareAttachments(launch.attachments ?? []);
@@ -76,6 +79,7 @@ export async function acceptQuickLaunch(
       launch,
     );
   session.id = deliveryId;
+  if (!existing && launch.sidebarHidden) session.sidebarHidden = true;
   if (launch.modelSettings) {
     session.modelSettings = mergeModelSettings(
       resolveModel(session.harness, session.model),
@@ -91,8 +95,8 @@ export async function acceptQuickLaunch(
       : tab.id;
     if (!tabId) throw new Error("The target pane is unavailable");
     workspace.updateSessions((sessions) => [...sessions, session]);
-    if (!placement) workspace.appendTab(tab, launch.cwd);
-    if (launch.reveal) {
+    if (!placement && openTab) workspace.appendTab(tab, launch.cwd);
+    if (launch.reveal && (placement || openTab)) {
       // The title bar filters tabs by this project. Select it before the tab.
       workspace.setProjectCwd(launch.cwd);
       workspace.setRecents(rememberProject(launch.cwd));
@@ -112,7 +116,12 @@ export async function acceptQuickLaunch(
       throw new Error("The workspace could not save the session draft yet.");
     }
   } else if (
-    !(await workspace.submit(session.id, launch.prompt, attachments))
+    !(await workspace.submit(
+      session.id,
+      launch.prompt,
+      attachments,
+      ...(launch.intent ? [{ intent: launch.intent }] : []),
+    ))
   ) {
     throw new Error("The workspace could not accept the queued session yet.");
   }
