@@ -293,6 +293,7 @@ export function createHostServer(
                 "attachments.read",
                 "sessions.draft",
                 "sessions.plan",
+                "sessions.fork",
                 "skills.list",
                 "agents.inventory",
               ],

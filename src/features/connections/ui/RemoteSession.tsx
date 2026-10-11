@@ -11,6 +11,7 @@ import type {
   WorkspaceMode,
   PlanBuildTarget,
 } from "../../sessions/model/session";
+import type { ForkFrom } from "../../sessions/model/fork";
 import { uploadRemoteAttachments } from "../model/remoteAttachments";
 import { temporaryWorktreeBranchName } from "../../source-control/model/worktrees";
 import type { AgentModel } from "../../sessions/model/models";
@@ -26,6 +27,8 @@ import {
   clearPendingRemoteCommand,
   loadRemoteSession,
   OPEN_CONNECTIONS_EVENT,
+  OPEN_REMOTE_SESSION_EVENT,
+  type OpenRemoteSession,
   pendingRemoteCommand,
   pendingRemoteFollowup,
   rememberRemotePendingWorktree,
@@ -1043,6 +1046,8 @@ function ConnectedRemoteSession({
     runtimeMode: configuration.mode,
     busy,
     blocks: unconfirmed ? [...blocks, unconfirmed] : blocks,
+    // A fork from a message puts that message back in the new tab's composer.
+    ...(shell.composerSeed ? { composerSeed: shell.composerSeed } : {}),
   };
 
   const catalogProblem = catalog?.errors[configuration.harness] ?? catalogError;
@@ -1051,6 +1056,7 @@ function ConnectedRemoteSession({
     const version = bindingVersion.current;
     setStarting((current) => current ? { ...current, failed: false } : current);
     const receipt = await run(pending);
+    if (receipt && pending.type === "fork") openFork(pending, receipt);
     if (receipt && pending.type === "create" && version === bindingVersion.current) {
       const next = pendingRemoteCommand(project.key, machine.environmentId, receipt.sessionId, shell.id);
       if (next) await run(next);
@@ -1176,6 +1182,40 @@ function ConnectedRemoteSession({
     void run(message(hostSession.id, "/compact"));
     return true;
   };
+  // A Claude conversation on a host that forks; the copy opens in a new tab.
+  const canFork =
+    !!descriptor?.capabilities.includes("sessions.fork") &&
+    hostSession?.harness === "claude" &&
+    !!hostSession.providerSessionId;
+  const fork = async (from?: ForkFrom) => {
+    if (!hostSession || pending || !online) return;
+    const command: HostCommand = {
+      type: "fork",
+      commandId: crypto.randomUUID(),
+      sessionId: hostSession.id,
+      ...(from
+        ? { beforeBlockId: from.beforeBlockId, ...(from.prefill ? { prefill: true } : {}) }
+        : {}),
+    };
+    const receipt = await run(command);
+    if (receipt) openFork(command, receipt);
+  };
+  /** Opens a fork the host accepted, also when it was confirmed by a retry. */
+  const openFork = (command: HostCommand, receipt: CommandReceipt) => {
+    if (command.type !== "fork") return;
+    const composerSeed = command.prefill
+      ? hostSession?.blocks.find((block) => block.id === command.beforeBlockId)?.text
+      : undefined;
+    window.dispatchEvent(
+      new CustomEvent<OpenRemoteSession>(OPEN_REMOTE_SESSION_EVENT, {
+        detail: {
+          project: shell.cwd,
+          sessionId: receipt.sessionId,
+          ...(composerSeed ? { composerSeed } : {}),
+        },
+      }),
+    );
+  };
   const saveDraft = (text: string, attachments: Attachment[]) =>
     submit(text, attachments, undefined, true);
   useEffect(
@@ -1283,6 +1323,7 @@ function ConnectedRemoteSession({
     onBuildPlan: (_, blockId, target) => buildPlan(blockId, target),
     onSecondOpinion: undefined,
     onHandoff: undefined,
+    onFork: canFork ? (_, from) => void fork(from) : undefined,
     onBtwSubmit: undefined,
     onBtwRetry: undefined,
     onBtwDelete: undefined,

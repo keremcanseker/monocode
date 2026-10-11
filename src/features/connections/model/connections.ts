@@ -22,6 +22,13 @@ let cachedMachines: RemoteMachine[] = [];
 let machinesLoaded = false;
 export const OPEN_CONNECTIONS_EVENT = "monocode:open-connections";
 export const OPEN_REMOTE_PROJECT_EVENT = "monocode:open-remote-project";
+/** Opens a host session in a tab of its project, as a fork does. */
+export const OPEN_REMOTE_SESSION_EVENT = "monocode:open-remote-session";
+export type OpenRemoteSession = {
+  project: string;
+  sessionId: string;
+  composerSeed?: string;
+};
 export const refreshRemoteMachines = () =>
   window.dispatchEvent(new Event(CHANGE));
 const TAB_KEY = "monocode.remote-tabs.v2";

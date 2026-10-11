@@ -670,7 +670,8 @@ const LocalSessionPane = memo(function LocalSessionPane({
     return () => window.removeEventListener(ADD_TO_CHAT_EVENT, onAdd);
   }, [addSelectionToChat, addToChatTarget]);
   const workCwd = sessionWorkCwd(session);
-  const forkable = !!onFork && canForkSession(session);
+  // A host session's tab passes onFork only when the host can fork it.
+  const forkable = !!onFork && (remote || canForkSession(session));
   const reviewHidden =
     remote ||
     !!session.inboxAsk ||

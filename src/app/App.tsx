@@ -676,6 +676,8 @@ import type { SettingsAnchor } from "../features/settings/ui/SettingsView";
 import {
   OPEN_CONNECTIONS_EVENT,
   OPEN_REMOTE_PROJECT_EVENT,
+  OPEN_REMOTE_SESSION_EVENT,
+  type OpenRemoteSession,
   REMOTE_HISTORY_UPDATED,
   cachedRemoteSessionSummary,
   rememberRemotePendingWorktree,
@@ -2774,7 +2776,7 @@ function Workspace({
   }, [appendTab, sessionDefaults?.runtimeMode, sidebarCwd]);
 
   const onSelectRemoteSession = useCallback(
-    (project: string, remoteSessionId: string) => {
+    (project: string, remoteSessionId: string, composerSeed?: string) => {
       setSearchViewOpen(false);
       setInboxViewOpen(false);
       setNotesViewOpen(false);
@@ -2791,7 +2793,10 @@ function Workspace({
       }
       // Reserve a dedicated tab immediately. An apparently blank remote tab
       // may hold composer text or a create/upload that the host has not accepted.
-      const session = newDefaultSession(project, sessionDefaults?.runtimeMode);
+      const session: Session = {
+        ...newDefaultSession(project, sessionDefaults?.runtimeMode),
+        ...(composerSeed ? { composerSeed } : {}),
+      };
       const tab = newTab(session.id);
       rememberRemoteSession(session.id, remoteSessionId);
       setSessions((prev) => [...prev, session]);
@@ -11852,6 +11857,16 @@ function Workspace({
     window.addEventListener(OPEN_REMOTE_PROJECT_EVENT, open);
     return () => window.removeEventListener(OPEN_REMOTE_PROJECT_EVENT, open);
   }, []);
+  useEffect(() => {
+    const open = (event: Event) => {
+      const { project, sessionId, composerSeed } = (
+        event as CustomEvent<OpenRemoteSession>
+      ).detail;
+      onSelectRemoteSession(project, sessionId, composerSeed);
+    };
+    window.addEventListener(OPEN_REMOTE_SESSION_EVENT, open);
+    return () => window.removeEventListener(OPEN_REMOTE_SESSION_EVENT, open);
+  }, [onSelectRemoteSession]);
 
   useEffect(() => {
     const onOpenMcp = () => openSettings("mcp");

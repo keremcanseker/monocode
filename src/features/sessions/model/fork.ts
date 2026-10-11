@@ -1,6 +1,7 @@
 import { canForkHarnessSession } from "../../../integrations/harness/core/registry";
 import {
   claudeForkPoints,
+  type ClaudeForkPoints,
   type ClaudePrompt,
 } from "../../../platform/tauri/fs";
 import { isRemoteProjectPath } from "../../projects/model/recents";
@@ -158,6 +159,24 @@ export async function forkPointBefore(
   session: Session,
   index: number,
 ): Promise<string | null> {
+  // A cut where MonoCode recorded the turn end needs no read of the record.
+  const recorded = index >= 0 && !!recordedForkPoint(session.blocks, index);
+  const points =
+    session.harness === "claude" && session.providerSessionId && !recorded
+      ? await claudeForkPoints(
+          session.providerSessionId,
+          session.providerAccountId,
+        ).catch(() => null)
+      : null;
+  return forkPointIn(session, index, points);
+}
+
+/** `forkPointBefore` with Claude's record already read, as a host reads it. */
+export function forkPointIn(
+  session: Session,
+  index: number,
+  points: ClaudeForkPoints | null,
+): string | null {
   const recorded = recordedForkPoint(
     session.blocks,
     index < 0 ? session.blocks.length : index,
@@ -166,10 +185,6 @@ export async function forkPointBefore(
     return recorded;
   }
   if (recorded && index >= 0) return recorded;
-  const points = await claudeForkPoints(
-    session.providerSessionId,
-    session.providerAccountId,
-  ).catch(() => null);
   if (index < 0) return points?.last ?? recorded;
   return points ? promptForkPoint(session.blocks, index, points.prompts) : null;
 }

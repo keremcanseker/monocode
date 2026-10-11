@@ -40,6 +40,8 @@ export interface HostProvider {
   cancel(id: string): Promise<void>;
   stop(id: string): Promise<void>;
   bind(id: string, providerId: string, cwd: string): void;
+  /** Start `id` as a copy of another conversation, made on its first turn. */
+  fork?(id: string, from: { from: string; at?: string }, cwd: string): void;
   approve(id: string, request: number, decision: ApprovalDecision): void;
   answer(id: string, request: number, reply: UserQuestionReply): void;
   generateTitle?(input: {
@@ -68,6 +70,13 @@ export const hostProviders: Record<RemoteProvider, HostProvider> = {
     cancel: claude.cancelClaudeTurn,
     stop: claude.forgetClaudeSession,
     bind: claude.bindClaudeSession,
+    fork: (threadId, { from, at }, cwd) =>
+      claude.forkClaudeSession({
+        threadId,
+        providerSessionId: from,
+        cwd,
+        providerTurnId: at,
+      }),
     approve: claude.respondClaudeApproval,
     answer: claude.respondClaudeQuestion,
     generateTitle: generateClaudeSessionTitle,

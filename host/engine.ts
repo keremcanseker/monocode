@@ -33,6 +33,14 @@ import {
 import type { HostProvider } from "./providers";
 import { HostStore } from "./store";
 import { parseRemoteAttachments, resolveAttachments } from "./attachments";
+import { readClaudeForkPoints } from "./claude-fork";
+import {
+  forkCut,
+  forkedSession,
+  forkPointIn,
+  recordedForkPoint,
+  sentUser,
+} from "../src/features/sessions/model/fork";
 
 // Streamed output is written in batches. Anything a user may need to act on
 // (approvals, questions, errors, completion) is written immediately.
@@ -125,6 +133,16 @@ export function parseCommand(input: unknown): HostCommand {
     };
   }
   if (v.type === "compact") return { type: "compact", commandId, sessionId };
+  if (v.type === "fork")
+    return {
+      type: "fork",
+      commandId,
+      sessionId,
+      ...(v.beforeBlockId !== undefined
+        ? { beforeBlockId: text(v.beforeBlockId, "message ID") }
+        : {}),
+      ...(v.prefill === true ? { prefill: true } : {}),
+    };
   if (v.type === "send" || v.type === "draft") {
     const attachments = parseRemoteAttachments(v.attachments);
     if (
@@ -284,6 +302,13 @@ export class HostEngine {
         this.provider(value.session.harness).bind(
           value.session.id,
           value.session.providerSessionId,
+          value.session.cwd,
+        );
+      // A fork Claude has not answered in yet is made again on its first turn.
+      else if (value.fork)
+        this.provider(value.session.harness).fork?.(
+          value.session.id,
+          value.fork,
           value.session.cwd,
         );
     }
@@ -521,6 +546,66 @@ export class HostEngine {
                 (block) => block.id !== draft.id,
               ),
             },
+          };
+        } else if (command.type === "fork") {
+          // Same rules as the desktop's onForkSession in App.tsx.
+          const source = value.session;
+          if (!source.providerSessionId || !provider.fork)
+            throw new Error("This conversation cannot be forked");
+          const cut = forkCut(
+            source,
+            command.beforeBlockId
+              ? { beforeBlockId: command.beforeBlockId, prefill: command.prefill }
+              : undefined,
+          );
+          if (!cut)
+            throw new Error(
+              "Nothing to fork yet. Wait for Claude to finish what it is doing, then fork again.",
+            );
+          const kept = cut.index < 0 ? undefined : source.blocks.slice(0, cut.index);
+          // Above the first message there is nothing to copy: a fresh
+          // conversation that starts with it.
+          const copies = !kept || kept.some(sentUser);
+          // ponytail: a synchronous read, only when MonoCode did not record
+          // the turn end; move it before the transaction if long transcripts stall the host.
+          const recorded =
+            cut.index >= 0 && !!recordedForkPoint(source.blocks, cut.index);
+          const point = copies
+            ? forkPointIn(
+                source,
+                cut.index,
+                recorded ? null : readClaudeForkPoints(source.providerSessionId),
+              )
+            : null;
+          if (kept && copies && !point)
+            throw new Error(
+              "Could not fork from here. Claude's own record of this conversation does not show this message.",
+            );
+          const now = Date.now();
+          value = {
+            projectId: value.projectId,
+            revision: 0,
+            status: "idle",
+            createdAt: now,
+            updatedAt: now,
+            ...(copies
+              ? {
+                  fork: {
+                    from: source.providerSessionId,
+                    ...(point ? { at: point } : {}),
+                  },
+                }
+              : {}),
+            // The host keeps model choices verbatim, as create and configure do.
+            session: {
+              ...forkedSession(source, kept),
+              model: source.model,
+              modelSettings: source.modelSettings,
+            },
+          };
+          effect = (saved) => {
+            if (saved.fork)
+              provider.fork!(saved.session.id, saved.fork, saved.session.cwd);
           };
         } else if (command.type === "send" || command.type === "compact") {
           if (value.status === "running")

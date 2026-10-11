@@ -56,12 +56,14 @@ export type HostSession = {
   pinned?: boolean;
   /** Temporary branch created by the composer for automatic first-turn naming. */
   autoWorktreeBranch?: string;
+  /** Host-only: the conversation a fork copies on its first turn, kept across restarts. */
+  fork?: { from: string; at?: string };
   /** Host-only: the revision at which each block last changed. */
   blockRevisions?: Record<string, number>;
 };
 export type HostSessionSummary = Omit<
   HostSession,
-  "session" | "blockRevisions"
+  "session" | "blockRevisions" | "fork"
 > & {
   id: string;
   title: string;
@@ -162,6 +164,14 @@ export type HostCommand =
       runtimeMode: RuntimeMode;
     }
   | { type: "compact"; commandId: string; sessionId: string }
+  /** Copies a Claude conversation into a new session, or what is above a message. */
+  | {
+      type: "fork";
+      commandId: string;
+      sessionId: string;
+      beforeBlockId?: string;
+      prefill?: boolean;
+    }
   | {
       type: "send";
       commandId: string;

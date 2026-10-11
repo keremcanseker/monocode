@@ -895,3 +895,93 @@ describe("headless session ownership", () => {
     ).toThrow();
   });
 });
+
+describe("forking a host conversation", () => {
+  function conversation() {
+    const context = setup("claude");
+    const { store, directory, id } = context;
+    // No transcript on disk: the fork point comes from the recorded turn end.
+    vi.stubEnv("CLAUDE_CONFIG_DIR", directory);
+    cleanups.push(() => vi.unstubAllEnvs());
+    context.provider.fork = vi.fn();
+    const value = store.session(id);
+    store.transaction(() =>
+      store.save(
+        {
+          ...value,
+          revision: value.revision + 1,
+          session: {
+            ...value.session,
+            title: "Plan",
+            providerSessionId: "source",
+            blocks: [
+              { id: "u1", role: "user", text: "first", providerTurnId: "a1", durationMs: 1 },
+              { id: "r1", role: "assistant", text: "one" },
+              { id: "u2", role: "user", text: "second", durationMs: 1 },
+              { id: "r2", role: "assistant", text: "two" },
+            ],
+          },
+        },
+        { type: "accepted" },
+      ),
+    );
+    return context;
+  }
+
+  it("copies what is above a message into a new session Claude forks on its first turn", async () => {
+    const { engine, store, provider, id } = conversation();
+    const receipt = engine.command({
+      type: "fork",
+      commandId: "fork",
+      sessionId: id,
+      beforeBlockId: "u2",
+      prefill: true,
+    });
+    expect(receipt.sessionId).not.toBe(id);
+    const fork = store.session(receipt.sessionId);
+    expect(fork.session.blocks.map((block) => block.id)).toEqual(["u1", "r1"]);
+    expect(fork.session.title).toContain("(fork)");
+    expect(fork.session.providerSessionId).toBeUndefined();
+    expect(provider.fork).toHaveBeenCalledWith(
+      receipt.sessionId,
+      { from: "source", at: "a1" },
+      fork.session.cwd,
+    );
+    // A host restart before Claude answers makes the copy again.
+    const restarted = new HostEngine(store, { claude: provider });
+    expect(provider.fork).toHaveBeenCalledTimes(2);
+    await restarted.close();
+  });
+
+  it("refuses a message Claude's record does not show, and a session never answered in", () => {
+    const { engine, store, id } = conversation();
+    const value = store.session(id);
+    store.transaction(() =>
+      store.save(
+        {
+          ...value,
+          revision: value.revision + 1,
+          session: {
+            ...value.session,
+            blocks: value.session.blocks.map(({ providerTurnId: _, ...block }) => block),
+          },
+        },
+        { type: "accepted" },
+      ),
+    );
+    expect(() =>
+      engine.command({ type: "fork", commandId: "fork", sessionId: id, beforeBlockId: "u2" }),
+    ).toThrow("Could not fork from here");
+    const fresh = engine.command({
+      type: "create",
+      commandId: "create-2",
+      projectId: value.projectId,
+      harness: "claude",
+      model: "claude:test",
+      runtimeMode: "supervised",
+    });
+    expect(() =>
+      engine.command({ type: "fork", commandId: "fork-2", sessionId: fresh.sessionId }),
+    ).toThrow("cannot be forked");
+  });
+});
