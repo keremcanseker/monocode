@@ -25,6 +25,7 @@ FROM node:24.21.0-bookworm-slim
 # tini reaps orphaned provider processes; the rest is what general-purpose agents expect to find.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       tini ca-certificates curl git openssh-client ripgrep jq less procps unzip python3 python3-venv \
+      postgresql-client \
   && rm -rf /var/lib/apt/lists/*
 ARG CLAUDE_CODE_VERSION=2.1.293
 ARG OPENCODE_VERSION=1.18.35
