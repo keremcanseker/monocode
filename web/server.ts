@@ -220,6 +220,11 @@ const TYPES: Record<string, string> = {
   ".json": "application/json",
   ".woff2": "font/woff2",
   ".wasm": "application/wasm",
+  // pdf.js: its worker, and the fonts and CMaps it fetches by name.
+  ".mjs": "text/javascript; charset=utf-8",
+  ".pfb": "application/octet-stream",
+  ".ttf": "font/ttf",
+  ".bcmap": "application/octet-stream",
 };
 
 // statSync still throws for NUL bytes and over-long names; an uncaught throw here would stop the server.

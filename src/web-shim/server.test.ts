@@ -271,6 +271,9 @@ describe("createWebServer", () => {
   writeFileSync(join(root, "index.html"), '<script>boot()</script><script type="module" src="/assets/app.js"></script>');
   writeFileSync(join(root, "assets", "app.js"), "export {}");
   writeFileSync(join(root, "assets", "notes.md"), "not served");
+  writeFileSync(join(root, "assets", "pdf.worker.min-x.mjs"), "export {}");
+  mkdirSync(join(root, "pdfjs", "cmaps"), { recursive: true });
+  writeFileSync(join(root, "pdfjs", "cmaps", "UniJIS-UTF16-H.bcmap"), "cmap");
   const proxied = { host: "monocode.istfin.com", "x-forwarded-proto": "https", "x-forwarded-for": "100.64.0.9" };
 
   async function webServer() {
@@ -285,6 +288,15 @@ describe("createWebServer", () => {
     expect(page.status).toBe(200);
     const asset = await call(url, { path: "/assets/app.js", method: "GET", headers: proxied, body: "" });
     expect(asset).toEqual({ status: 200, body: "export {}" });
+    await close(server);
+  });
+
+  it("serves the PDF viewer's worker and the CMaps it fetches", async () => {
+    const { server, url } = await webServer();
+    const worker = await call(url, { path: "/assets/pdf.worker.min-x.mjs", method: "GET", headers: proxied, body: "" });
+    expect(worker).toEqual({ status: 200, body: "export {}" });
+    const cmap = await call(url, { path: "/pdfjs/cmaps/UniJIS-UTF16-H.bcmap", method: "GET", headers: proxied, body: "" });
+    expect(cmap).toEqual({ status: 200, body: "cmap" });
     await close(server);
   });
 

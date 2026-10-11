@@ -344,9 +344,11 @@ function PdfView({ bytes }: { bytes: Uint8Array }) {
       const loading = pdfjs.getDocument({
         data: bytes.slice(),
         // The worker fetches these itself. pdf.js would fetch tauri:// URLs
-        // on the page instead, where the CSP's connect-src refuses them; the
-        // worker runs without a CSP. Should that fetch fail, pdf.js falls
-        // back to substitute fonts and leaves out the images it can't decode.
+        // on the page instead, where the CSP's connect-src refuses them; in
+        // the desktop app the worker runs without a CSP. Web mode's server
+        // sends one with no wasm-unsafe-eval, so there the decoders fall back
+        // to their slower JS builds. Should a fetch fail, pdf.js uses
+        // substitute fonts and leaves out the images it can't decode.
         ...pdfjsResourceUrls(),
         useWorkerFetch: true,
       });
