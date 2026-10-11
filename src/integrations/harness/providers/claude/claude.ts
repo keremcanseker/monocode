@@ -157,11 +157,15 @@ type Live = {
   /** A task finished after Claude yielded; its follow-up turn is on the way. */
   awaitingResume: ReturnType<typeof setTimeout> | null;
   /**
-   * A message was written into the turn and Claude has not reached a tool
-   * boundary since, where it takes such messages in. If the turn ends first,
-   * Claude answers it in a turn of its own right after.
+   * Results still owed to this turn: one for the prompt, one more for each
+   * message written in while it ran. Claude answers a message that came in
+   * too late for the turn in a turn of its own, right after.
    */
-  steerPending: boolean;
+  outstandingResults: number;
+  /** The process is gone or going; nothing it still says counts. */
+  closed: boolean;
+  /** Set by Stop, settled once the process has been stopped. */
+  stopped: { promise: Promise<void>; resolve: () => void } | null;
   /** Last background list sent to the UI, to skip repeats. */
   backgroundKey: string;
   /** Finished-subagent notes held until Claude picks the thread back up. */
@@ -241,6 +245,10 @@ const tasksByThread = new Map<
 /** Task-list block key for TaskCreate/TaskUpdate items. */
 const CLAUDE_TASKS_KEY = "claude-tasks";
 const cancelledThreads = new Set<string>();
+/** Bumped by every Stop, so a send still starting under the old one is dropped. */
+const cancellationEpochs = new Map<string, number>();
+const cancellationEpoch = (sessionId: string) =>
+  cancellationEpochs.get(sessionId) ?? 0;
 
 /**
  * Threads waiting to start as a copy of another conversation, by thread id.
@@ -294,12 +302,18 @@ export function setClaudeBinaryResolver(
 }
 
 export async function sendClaudeTurn(input: SendTurnInput): Promise<void> {
+  const epoch = cancellationEpoch(input.sessionId);
   let live: Live;
   try {
     live = await ensureLive(input);
   } catch (error) {
     cancelledThreads.delete(input.sessionId);
+    if (epoch !== cancellationEpoch(input.sessionId)) return;
     throw error;
+  }
+  if (epoch !== cancellationEpoch(input.sessionId)) {
+    cancelledThreads.delete(input.sessionId);
+    return;
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
@@ -308,6 +322,7 @@ export async function sendClaudeTurn(input: SendTurnInput): Promise<void> {
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (epoch !== cancellationEpoch(input.sessionId) || live.closed) return;
       live.cancelled = false;
       live.muteUpdates = false;
       try {
@@ -323,10 +338,21 @@ export async function sendClaudeTurn(input: SendTurnInput): Promise<void> {
 export async function compactClaudeContext(
   input: CompactContextInput,
 ): Promise<void> {
+  const epoch = cancellationEpoch(input.sessionId);
   const settingsKey = settingsKeyFor(input);
   let live = liveByThread.get(input.sessionId);
   if (!live || live.cwd !== input.cwd || live.settingsKey !== settingsKey) {
-    live = await ensureLive(input);
+    try {
+      live = await ensureLive(input);
+    } catch (error) {
+      cancelledThreads.delete(input.sessionId);
+      if (epoch !== cancellationEpoch(input.sessionId)) return;
+      throw error;
+    }
+  }
+  if (epoch !== cancellationEpoch(input.sessionId)) {
+    cancelledThreads.delete(input.sessionId);
+    return;
   }
   if (cancelledThreads.delete(input.sessionId)) return;
 
@@ -335,6 +361,7 @@ export async function compactClaudeContext(
   live.turns = live.turns
     .catch(() => undefined)
     .then(async () => {
+      if (epoch !== cancellationEpoch(input.sessionId) || live.closed) return;
       live.cancelled = false;
       live.muteUpdates = false;
       live.manualCompaction = true;
@@ -371,8 +398,13 @@ export async function steerClaudeTurn(input: SteerTurnInput): Promise<void> {
   const content = (message.message as { content: unknown[] }).content;
   if (content.length === 0) return;
 
-  await writeJson(input.sessionId, message);
-  live.steerPending = true;
+  live.outstandingResults += 1;
+  try {
+    await writeJson(input.sessionId, message);
+  } catch (error) {
+    live.outstandingResults -= 1;
+    throw error;
+  }
 }
 
 export function respondClaudeApproval(
@@ -398,6 +430,7 @@ export function respondClaudeQuestion(
 }
 
 export async function cancelClaudeTurn(sessionId: string): Promise<void> {
+  cancellationEpochs.set(sessionId, cancellationEpoch(sessionId) + 1);
   const live = liveByThread.get(sessionId);
   if (!live) {
     cancelledThreads.add(sessionId);
@@ -405,6 +438,15 @@ export async function cancelClaudeTurn(sessionId: string): Promise<void> {
   }
   live.cancelled = true;
   live.muteUpdates = true;
+  // Stop follows a cancel; a message sent before it lands waits for it and
+  // starts a fresh process, so it can never be written into this one.
+  if (!live.stopped) {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    live.stopped = { promise, resolve };
+  }
   for (const [, pending] of live.approvals) pending.resolve("deny");
   live.approvals.clear();
   for (const [, pending] of live.questions)
@@ -463,6 +505,8 @@ export async function stopClaudeSession(sessionId: string): Promise<void> {
   liveByThread.delete(sessionId);
   if (live) {
     live.muteUpdates = true;
+    live.closed = true;
+    clearAwaitingResume(live);
     for (const [, pending] of live.approvals) pending.resolve("deny");
     live.approvals.clear();
     for (const [, pending] of live.questions)
@@ -477,6 +521,7 @@ export async function stopClaudeSession(sessionId: string): Promise<void> {
   }
   unwatchChild(sessionId);
   await killChild(sessionId).catch(() => undefined);
+  live?.stopped?.resolve();
 }
 
 export async function forgetClaudeSession(sessionId: string): Promise<void> {
@@ -542,9 +587,14 @@ export function forkClaudeSession(input: ForkSessionInput): void {
 async function ensureLive(input: HarnessSessionInput): Promise<Live> {
   const settingsKey = settingsKeyFor(input);
   const planning = input.intent === "plan";
-  const existing = liveByThread.get(input.sessionId);
+  let existing = liveByThread.get(input.sessionId);
+  if (existing?.stopped) {
+    await existing.stopped.promise;
+    existing = liveByThread.get(input.sessionId);
+  }
   if (
     existing &&
+    !existing.closed &&
     existing.cwd === input.cwd &&
     existing.settingsKey === settingsKey &&
     existing.planning === planning
@@ -624,7 +674,9 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     backgroundTasks: new Map(),
     backgroundRows: new Map(),
     awaitingResume: null,
-    steerPending: false,
+    outstandingResults: 0,
+    closed: false,
+    stopped: null,
     backgroundKey: "",
     taskNotes: [],
     stoppedAgentCalls: new Set(),
@@ -657,12 +709,17 @@ async function ensureLive(input: HarnessSessionInput): Promise<Live> {
     input.sessionId,
     (line) => {
       const current = liveRef.current;
-      if (!current) return;
+      if (!current || current.closed) return;
       handleLine(input.sessionId, current, line);
     },
     (code) => {
-      liveByThread.delete(input.sessionId);
       const current = liveRef.current;
+      if (liveByThread.get(input.sessionId) === current)
+        liveByThread.delete(input.sessionId);
+      if (current) {
+        current.closed = true;
+        clearAwaitingResume(current);
+      }
       if (!current?.muteUpdates) {
         (current?.onEvent ?? input.onEvent)({ type: "session.ended", code });
       }
@@ -737,6 +794,7 @@ async function runTurn(live: Live, input: SendTurnInput): Promise<void> {
   live.backgroundKey = "";
   live.taskNotes = [];
   live.turnResultSeen = false;
+  live.outstandingResults = 1;
   // A turn that records nothing does not end where the last one did.
   live.lastEntry = "";
 
@@ -884,9 +942,6 @@ function handleLine(sessionId: string, live: Live, line: string): void {
     return;
   }
   if (type === "user") {
-    // A tool result is the boundary where Claude takes in a message
-    // written into the turn.
-    if (!isSubagentMessage(rec)) live.steerPending = false;
     handleUser(live, rec);
     return;
   }
@@ -1177,10 +1232,13 @@ function handleResult(live: Live, rec: Record<string, unknown>): void {
     live.onEvent({ type: "usage.limited", ...usageLimit });
   }
   live.turnResultSeen = true;
-  // Claude answers a message that came in too late for this turn in one of
-  // its own; keep the MonoCode turn open for it, as for a finished task.
-  if (live.steerPending && live.activeTurn && !live.cancelled) {
-    live.steerPending = false;
+  live.outstandingResults = Math.max(0, live.outstandingResults - 1);
+  // A message written in is answered in a turn of its own when it came too
+  // late for this one; keep the MonoCode turn open for that, as for a
+  // finished task. Taken in mid-turn, it gets no result of its own, so the
+  // wait is bounded like that one.
+  if (live.outstandingResults > 0 && live.activeTurn && !live.cancelled) {
+    live.outstandingResults = 0;
     clearAwaitingResume(live);
     live.awaitingResume = setTimeout(() => {
       live.awaitingResume = null;
@@ -2113,6 +2171,8 @@ function launchOptions(
 
 /** Exported for tests. */
 export function __claudeTestReset(): void {
+  for (const live of liveByThread.values()) clearAwaitingResume(live);
+  cancellationEpochs.clear();
   liveByThread.clear();
   resumeByThread.clear();
   tasksByThread.clear();

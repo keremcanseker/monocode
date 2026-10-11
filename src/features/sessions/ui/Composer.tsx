@@ -1,3 +1,4 @@
+import { IS_MAC } from "../../../platform/tauri/platform";
 import {
   ArrowUp,
   AiIdea,
@@ -1279,9 +1280,12 @@ export function Composer({
     onRecallLastTurnReady(recallLastTurn);
   }, [editLastTurnSupported, onRecallLastTurnReady, recallLastTurn]);
 
-  const submit = (value: string) => {
+  // Set for a submit that stops the running turn first (Cmd/Ctrl+Enter).
+  const interruptRef = useRef(false);
+  const submit = (value: string, interrupt = false) => {
     if (disabled || worktreeRemoved || submitLockRef.current) return;
     submitLockRef.current = true;
+    interruptRef.current = interrupt;
     void completeSubmit(value).finally(() => {
       submitLockRef.current = false;
     });
@@ -1428,6 +1432,7 @@ export function Composer({
             : orchestrationSelected || orchestratorCommand.matched
               ? "orchestrate"
               : "default",
+        ...(interruptRef.current ? { interrupt: true } : {}),
         // A remote follow-up can still fail after the composer clears. Leave
         // newer composer text alone; only an untouched composer gets it back.
         ...(remote
@@ -1620,7 +1625,12 @@ export function Composer({
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      submit(e.currentTarget.value);
+      // Cmd/Ctrl+Enter while the agent works: stop it and send this instead
+      // of handing the message to the running turn.
+      submit(
+        e.currentTarget.value,
+        busy && !!onStop && (IS_MAC ? e.metaKey : e.ctrlKey),
+      );
     }
   };
 

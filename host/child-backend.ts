@@ -392,6 +392,8 @@ export class HostChildBackend implements ChildBackend {
           void this.kill(id);
           return;
         }
+        // A killed or replaced child's last lines are not the session's.
+        if (this.children.get(id) !== child) return;
         this.emit(`harness-${stream}`, { sessionId: id, line });
       }
       if (buffer.length > 8 * 1024 * 1024) {
@@ -400,7 +402,7 @@ export class HostChildBackend implements ChildBackend {
       }
     });
     child[stream].on("end", () => {
-      if (buffer)
+      if (buffer && this.children.get(id) === child)
         this.emit(`harness-${stream}`, { sessionId: id, line: buffer });
     });
   }

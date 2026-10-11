@@ -97,6 +97,8 @@ export type ComposerTurnOptions = {
   onRejected?: () => void;
   /** Promote an existing unsent transcript block instead of appending a turn. */
   draftBlockId?: string;
+  /** Stop the running turn first; this message starts the next one. */
+  interrupt?: boolean;
 };
 
 export type PlanStatus = "streaming" | "ready" | "building" | "built";

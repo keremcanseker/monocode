@@ -1677,6 +1677,8 @@ function Workspace({
     new Map<string, ReturnType<typeof synchronizeProjectLocation>>(),
   );
   const submitAfterProjectSyncRef = useRef<Submit>(() => false);
+  /** Stop, defined later; a submit that interrupts the running turn uses it. */
+  const onStopRef = useRef<(sessionId: string) => void>(() => {});
 
   useEffect(() => {
     for (const project of recents) {
@@ -7181,7 +7183,10 @@ function Workspace({
         });
       }
 
-      if (current.busy && !pendingSwitch) {
+      // Stop first, then the message starts the next turn: the provider
+      // waits for the old process to go before it starts a fresh one.
+      if (current.busy && options?.interrupt) onStopRef.current(sessionId);
+      if (current.busy && !pendingSwitch && !options?.interrupt) {
         if (
           operatorCommand.matched &&
           options?.queuedMessageId &&
@@ -7452,7 +7457,11 @@ function Workspace({
         live && !pendingSwitch ? pendingHandoff(current) : null;
 
       if (pendingSwitch && current.busy) {
-        void cancelHarnessTurn(pendingSwitch.from, sessionId);
+        // Stop follows the cancel, or a later send to this harness would wait
+        // forever on the stopped process (ensureLive awaits live.stopped).
+        void cancelHarnessTurn(pendingSwitch.from, sessionId).finally(() =>
+          stopHarnessSession(pendingSwitch.from, sessionId),
+        );
       }
 
       dismissNoticesForContinuedSession(sessionId);
@@ -8294,6 +8303,7 @@ function Workspace({
     ],
   );
   submitAfterProjectSyncRef.current = submitSession;
+  onStopRef.current = (sessionId) => void onStop(sessionId);
   // Interactive callers use the immediate result to clear their composer. The
   // queued-launch receiver uses submitSession to await the actual acceptance.
   const onSubmit = useCallback(

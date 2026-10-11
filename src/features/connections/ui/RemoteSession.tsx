@@ -972,23 +972,35 @@ function ConnectedRemoteSession({
       options?.intent === "plan" || options?.intent === "build"
         ? options.intent
         : "default";
-    if (busy)
-      return (
+    if (busy) {
+      const followUp =
         !!hostSession &&
         queueSupported &&
         !asDraft &&
         !planBlockId &&
         !options?.draftBlockId &&
-        message(hostSession.id, text, undefined, [], intent).type === "send" &&
-        enqueue(
-          hostSession.id,
-          text,
-          attachments,
-          intent,
-          options?.onRejected,
-          steerable && intent === "default",
-        )
+        message(hostSession.id, text, undefined, [], intent).type === "send";
+      if (!followUp) return false;
+      // Stop first; the host sends the message as soon as the turn is over.
+      if (options?.interrupt) {
+        const id = hostSession.id;
+        // Only steer once the host confirmed the stop; otherwise the message
+        // would land in the still-running turn instead of interrupting it.
+        void cancelTurn().then((receipt) => {
+          if (receipt) enqueue(id, text, attachments, intent, options.onRejected, true);
+          else options.onRejected?.();
+        });
+        return true;
+      }
+      return enqueue(
+        hostSession.id,
+        text,
+        attachments,
+        intent,
+        options?.onRejected,
+        steerable && intent === "default",
       );
+    }
     const turn = optimisticTurn(
       text,
       attachments,
@@ -1241,15 +1253,16 @@ function ConnectedRemoteSession({
     submit(`Build the approved plan:\n\n${block.text}`, [], { intent: "build" }, false, blockId);
   };
 
-  const stopTurn = () => {
-    if (hostSession?.busy && snapshot?.runId)
-      void run({
-        type: "cancel",
-        commandId: crypto.randomUUID(),
-        sessionId: hostSession.id,
-        runId: snapshot.runId,
-      });
+  const cancelTurn = async () => {
+    if (!hostSession?.busy || !snapshot?.runId) return undefined;
+    return run({
+      type: "cancel",
+      commandId: crypto.randomUUID(),
+      sessionId: hostSession.id,
+      runId: snapshot.runId,
+    });
   };
+  const stopTurn = () => void cancelTurn();
   const approve = (
     requestId: number,
     decision: Parameters<SessionPaneProps["onApproval"]>[2],

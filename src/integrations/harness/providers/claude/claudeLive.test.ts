@@ -1499,21 +1499,60 @@ describe("claude subagents", () => {
     expect(settled).toBe(true);
   });
 
-  it("ends the turn at its result when Claude took the message in mid-turn", async () => {
+  it("starts a fresh process for a message sent after Stop, never the stopped one", async () => {
     const { turn } = await startTurn("s1");
-    await steerClaudeTurn({
+    const stopped = cancelClaudeTurn("s1");
+    // As the app does: Stop, then the next message, then the process goes.
+    const events: HarnessEvent[] = [];
+    const next = sendClaudeTurn({
       sessionId: "s1",
       cwd: "/repo",
       model: "claude:claude-sonnet-5",
-      text: "also check the tests",
+      modelSettings: {},
+      runtimeMode: "supervised",
+      text: "do this instead",
+      attachments: [],
+      onEvent: (event) => events.push(event),
     });
-    emit({
-      type: "user",
-      session_id: "sess_1",
-      message: { content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }] },
-    });
-    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await stopped;
     await turn;
+    const before = spawned.length;
+    await stopClaudeSession("s1");
+    await waitFor(() => spawned.length > before, "second spawn");
+    expect(sent.filter((line) => line.includes("do this instead"))).toHaveLength(0);
+    emit({ type: "system", subtype: "init", session_id: "sess_1" });
+    await waitFor(
+      () => sent.some((line) => line.includes("do this instead")),
+      "prompt in the new process",
+    );
+    expect(spawned.at(-1)).toContain("--resume");
+    emit({ type: "result", subtype: "success", session_id: "sess_1" });
+    await next;
+  });
+
+  it("drops a message that was still starting when Stop came", async () => {
+    const events: HarnessEvent[] = [];
+    const turn = sendClaudeTurn({
+      sessionId: "s1",
+      cwd: "/repo",
+      model: "claude:claude-sonnet-5",
+      modelSettings: {},
+      runtimeMode: "supervised",
+      text: "never send this",
+      attachments: [],
+      onEvent: (event) => events.push(event),
+    });
+    await waitFor(
+      () =>
+        parse().some(
+          (m) => (m.request as Record<string, unknown> | undefined)?.subtype === "initialize",
+        ),
+      "initialize",
+    );
+    await cancelClaudeTurn("s1");
+    await stopClaudeSession("s1");
+    await turn;
+    expect(sent.filter((line) => line.includes("never send this"))).toHaveLength(0);
   });
 
   it("stays busy after a parent result while a background subagent is running", async () => {

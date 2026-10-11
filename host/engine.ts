@@ -317,7 +317,13 @@ export class HostEngine {
   private switchingProjects = new Set<string>();
   private running = new Map<
     string,
-    { runId: string; done: Promise<void>; cancelled: boolean; persistenceFailed: boolean }
+    {
+      runId: string;
+      done: Promise<void>;
+      cancelled: boolean;
+      persistenceFailed: boolean;
+      sendAfterStop: boolean;
+    }
   >();
   /** Running sessions, including streamed events not yet written to disk. */
   private live = new Map<
@@ -746,20 +752,26 @@ export class HostEngine {
           const lastTurn = value.session.blocks.findLast(
             (block) => block.role === "user" && block.startedAt != null,
           );
+          const stopping = this.running.get(command.sessionId)?.cancelled;
           if (
             value.status !== "running" ||
             !provider.steer ||
             // A turn being stopped, or a compaction, cannot answer it.
-            this.running.get(command.sessionId)?.cancelled ||
+            stopping ||
             lastTurn?.text === "/compact"
           ) {
-            // The turn ended meanwhile: the message goes next instead.
+            if (stopping) this.running.get(command.sessionId)!.sendAfterStop = true;
+            // The turn ended meanwhile: the message goes next instead. A
+            // message the user just sent is never left behind a paused queue.
+            const status = fromQueue
+              ? (value.session.queueStatus ?? "active")
+              : "active";
             value = {
               ...value,
               session: {
                 ...value.session,
+                queueStatus: status,
                 queuedMessages: [message, ...rest],
-                queueStatus: value.session.queueStatus ?? "active",
               },
             };
             effect = () => this.dispatchQueued(command.sessionId);
@@ -1150,7 +1162,14 @@ export class HostEngine {
   ): void {
     const { session, runId } = value;
     const provider = this.provider(session.harness);
-    const active = { runId: runId!, done: Promise.resolve(), cancelled: false, persistenceFailed: false };
+    const active = {
+      runId: runId!,
+      done: Promise.resolve(),
+      cancelled: false,
+      persistenceFailed: false,
+      // A message sent after Stop goes next instead of waiting for Resume.
+      sendAfterStop: false,
+    };
     this.running.set(session.id, active);
     this.live.set(session.id, { value, events: [] });
     active.done = Promise.resolve()
@@ -1198,7 +1217,7 @@ export class HostEngine {
               this.closing || active.persistenceFailed ? "interrupted" : "idle",
               message,
               undefined,
-              active.cancelled,
+              active.cancelled && !active.sendAfterStop,
             ),
             { type: "settled", error, cancelled: active.cancelled },
           );

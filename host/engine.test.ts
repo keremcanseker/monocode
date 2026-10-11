@@ -730,6 +730,51 @@ describe("headless session ownership", () => {
     turns[2].finish();
   });
 
+  it("sends an after-Stop message next even when the queue was already paused", async () => {
+    const { engine, store, turns, provider, id } = setup("claude");
+    provider.steer = vi.fn(async () => {});
+    engine.command({ type: "send", commandId: "send", sessionId: id, text: "Work" });
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
+    engine.command({ type: "enqueue", commandId: "older", sessionId: id, text: "Later" });
+    // Stop pauses the queue; the process goes idle before the next message.
+    const first = store.session(id);
+    engine.command({ type: "cancel", commandId: "stop1", sessionId: id, runId: first.runId! });
+    turns[0].finish();
+    await vi.waitFor(() => expect(store.session(id).status).toBe("idle"));
+    expect(store.session(id).session.queueStatus).toBe("paused");
+    // A fresh turn runs; the user stops it and sends a new message.
+    engine.command({ type: "resumeQueue", commandId: "resume", sessionId: id });
+    await vi.waitFor(() => expect(turns).toHaveLength(2));
+    const second = store.session(id);
+    engine.command({ type: "cancel", commandId: "stop2", sessionId: id, runId: second.runId! });
+    engine.command({ type: "steer", commandId: "instead", sessionId: id, text: "Do this instead" });
+    expect(store.session(id).session.queueStatus).toBe("active");
+    turns[1].finish();
+    await vi.waitFor(() =>
+      expect(turns.map((turn) => turn.input.text)).toContain("Do this instead"),
+    );
+    turns.at(-1)!.finish();
+  });
+
+  it("sends a message that follows Stop right after it, without Resume", async () => {
+    const { engine, store, turns, provider, id } = setup("claude");
+    provider.steer = vi.fn(async () => {});
+    engine.command({ type: "send", commandId: "send", sessionId: id, text: "Work" });
+    await vi.waitFor(() => expect(turns).toHaveLength(1));
+    engine.command({ type: "enqueue", commandId: "older", sessionId: id, text: "Later" });
+    const { runId } = store.session(id);
+    engine.command({ type: "cancel", commandId: "stop", sessionId: id, runId: runId! });
+    engine.command({ type: "steer", commandId: "instead", sessionId: id, text: "Do this instead" });
+    expect(provider.steer).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(turns).toHaveLength(2));
+    expect(turns[1].input.text).toBe("Do this instead");
+    expect(store.session(id).session.queueStatus).toBe("active");
+    turns[1].finish();
+    await vi.waitFor(() => expect(turns).toHaveLength(3));
+    expect(turns[2].input.text).toBe("Later");
+    turns[2].finish();
+  });
+
   it("sends a follow-up at once when it reaches the host after the turn ended", async () => {
     const { engine, turns, id } = setup();
     engine.command({ type: "enqueue", commandId: "late", sessionId: id, text: "Next" });
