@@ -20,6 +20,8 @@ type Props = {
   /** The opened folder; checkouts below it are listed under Repositories. */
   projectCwd: string;
   enabled: boolean;
+  showGraph?: boolean;
+  compactHeader?: boolean;
   textHarness?: HarnessId;
   selectedPath?: string;
   selectedKind?: GitFileDiffKind;
@@ -44,6 +46,8 @@ export function SourceControl({
   cwd,
   projectCwd,
   enabled,
+  showGraph,
+  compactHeader,
   textHarness,
   selectedPath,
   selectedKind,
@@ -77,6 +81,8 @@ export function SourceControl({
         key={repoCwd}
         cwd={repoCwd}
         enabled={enabled}
+        showGraph={showGraph}
+        compactHeader={compactHeader}
         textHarness={textHarness}
         selectedPath={selected}
         selectedKind={selectedKind}

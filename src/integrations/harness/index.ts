@@ -191,6 +191,7 @@ export {
   canForkHarnessSession,
   forkHarnessSession,
   bindHarnessSession,
+  transferHarnessSessionAccount,
   refreshHarnessCatalogs,
   generateHarnessTitle,
   generateHarnessCommitMessage,
