@@ -12,6 +12,24 @@
   <img width="1680" height="1050" alt="MonoCode with agent sessions open side by side" src="https://github.com/user-attachments/assets/2cd4a6ec-eb1e-4b45-8627-a76442ea3874" />
 </p>
 
+> [!NOTE]
+> **This is [Keremcan Şeker](https://github.com/keremcanseker)'s fork of [hardbeat920/monocode](https://github.com/hardbeat920/monocode).** I use it every day to run coding agents across my products, and I keep it merged with upstream (currently v0.15.0). Everything below this note is upstream's README. What the fork adds:
+>
+> **Web mode: MonoCode in the browser.** A Tauri IPC shim boots the desktop UI in a browser, backed by a MonoCode host. A small Node server sits behind a proxy, and a container image ships Claude Code, OpenCode and Hermes Agent (with its Telegram gateway, MCP support and Playwright with Chromium). The layout adapts to phones. I run it on a server and drive agents from anywhere.
+>
+> **Working with running agents.**
+> - Steer a running turn from the browser, the way the desktop does, with a host-side message queue as the fallback.
+> - Stop the running turn and send the next message in one step (Cmd/Ctrl+Enter).
+> - Fork a Claude conversation from any message into a new tab, locally or on a remote host (a Node port of the transcript fork-point lookup).
+> - Claude's own subagents are listed, timed and stoppable, and finished ones stop reading as running.
+> - The context meter updates right after a manual `/compact`.
+>
+> **Multi-repo projects.**
+> - The Changes pane lists nested git repositories with branch, counts and ahead/behind.
+> - Orchestration workers in a folder of repositories get one isolated worktree per repo, and their edits are recorded so review can integrate them.
+>
+> **Smaller things.** PDFs open in the file viewer (pdf.js under Tauri's CSP), OpenCode commands and host skills appear in the remote slash menu, and large non-git folders stay searchable.
+
 Works with your subscriptions on Claude Code, Codex, Cursor, Grok Build, OpenCode, Antigravity, Pi, omp, fx, Hermes Agent, and Devin. If they’re installed and logged in, MonoCode can run them. Tabs are sessions. The composer is the input. MonoCode does not sell tokens.
 
 ## Install
